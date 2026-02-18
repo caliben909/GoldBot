@@ -1,0 +1,52 @@
+# Virtual environment
+venv_311/
+venv/
+.env
+.venv
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+*.txt
+
+# Configuration
+config/config.yaml
+config/config_optimized.yaml
+
+# Temporary files
+*.tmp
+*.temp
+
+# Database
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trading data
+data/
+*.csv
+*.parquet
+
+# Models
+*.onnx
+*.h5
+*.pkl
+
+# Backtesting results
+backtest_results/
+*.html
+*.json
