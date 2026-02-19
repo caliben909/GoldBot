@@ -42,8 +42,16 @@ class BacktestConfig:
     slippage_model: str = 'percentage'  # 'fixed', 'percentage', 'market_impact'
     market_impact_params: Dict = field(default_factory=dict)
     data_source: str = 'database'
+    data_quality: Dict = field(default_factory=lambda: {
+        'sources': {
+            'yfinance': {'enabled': True, 'priority': 1},
+            'csv': {'enabled': False, 'priority': 2},
+            'mt5': {'enabled': False, 'priority': 3},
+            'binance': {'enabled': False, 'priority': 4}
+        }
+    })
     symbols: List[str] = field(default_factory=list)
-    timeframes: List[str] = field(default_factory=lambda: ['1H'])
+    timeframes: List[str] = field(default_factory=lambda: ['1D'])
     
     # Monte Carlo settings
     monte_carlo_enabled: bool = True
@@ -160,7 +168,35 @@ class BacktestEngine:
     """
     
     def __init__(self, config: dict):
+        # Initialize backtest config
         self.config = BacktestConfig(**config['backtesting'])
+        
+        # Extract symbols from assets config
+        if self.config.symbols is None or len(self.config.symbols) == 0:
+            self.config.symbols = []
+            # Add forex symbols
+            if config.get('assets', {}).get('forex', {}).get('enabled', False):
+                forex_symbols = config.get('assets', {}).get('forex', {}).get('symbols', [])
+                self.config.symbols.extend(forex_symbols)
+            # Add crypto symbols
+            if config.get('assets', {}).get('crypto', {}).get('enabled', False):
+                crypto_symbols = config.get('assets', {}).get('crypto', {}).get('symbols', [])
+                self.config.symbols.extend(crypto_symbols)
+            # Add indices symbols
+            if config.get('assets', {}).get('indices', {}).get('enabled', False):
+                indices_symbols = config.get('assets', {}).get('indices', {}).get('symbols', [])
+                self.config.symbols.extend(indices_symbols)
+        
+        logger.info(f"Backtest will run on symbols: {', '.join(self.config.symbols)}")
+        
+        # Ensure data quality config includes yfinance
+        if 'yfinance' not in self.config.data_quality['sources']:
+            self.config.data_quality['sources']['yfinance'] = {'enabled': True, 'priority': 1}
+        
+        # Disable other sources to ensure yfinance is used
+        for source in ['csv', 'mt5', 'binance', 'binance_futures']:
+            if source in self.config.data_quality['sources']:
+                self.config.data_quality['sources'][source]['enabled'] = False
         self.logger = logging.getLogger(__name__)
         
         # Initialize engines
@@ -239,7 +275,15 @@ class BacktestEngine:
     
     async def _load_data(self) -> Dict[str, pd.DataFrame]:
         """Load historical data for all symbols"""
-        self.data_engine = DataEngine(self.config.__dict__)
+        # Create a complete config dict for DataEngine
+        data_config = {
+            'data_quality': self.config.data_quality,
+            'execution': {
+                'mt5': {'enabled': False},
+                'binance': {'enabled': False}
+            }
+        }
+        self.data_engine = DataEngine(data_config)
         await self.data_engine.initialize()
         
         data = {}
@@ -279,8 +323,24 @@ class BacktestEngine:
             for key, df in data.items():
                 current_data[key] = df[df.index <= timestamp].copy()
             
-            # Generate signals
-            signals = await strategy.generate_trading_signals(current_data)
+            # Generate signals for each symbol
+            signals = []
+            for key, df in current_data.items():
+                if df.empty:
+                    continue
+                    
+                # Extract symbol (e.g., 'EURUSD' from 'EURUSD_1D')
+                if '_' in key:
+                    symbol = key.split('_')[0]
+                else:
+                    symbol = key
+                    
+                # Generate signals for this symbol
+                try:
+                    symbol_signals = await strategy.generate_trading_signals(df, symbol)
+                    signals.extend(symbol_signals)
+                except Exception as e:
+                    self.logger.error(f"Failed to generate signals for {symbol}: {e}")
             
             # Process signals
             for signal in signals:
@@ -300,9 +360,35 @@ class BacktestEngine:
         
         return all_trades, equity_series
     
+    def _calculate_position_size(self, signal: Dict, current_equity: float) -> float:
+        """Calculate position size based on risk management parameters"""
+        # Get risk per trade from config (percentage)
+        risk_per_trade = self.config.get('risk_management', {}).get('max_risk_per_trade', 0.25) / 100
+        
+        # Calculate risk amount in currency
+        risk_amount = current_equity * risk_per_trade
+        
+        # Calculate risk per unit (distance from entry to stop loss)
+        risk_per_unit = abs(signal.entry_price - signal.stop_loss)
+        
+        if risk_per_unit == 0:
+            return 0.0
+            
+        # Calculate position size
+        quantity = risk_amount / risk_per_unit
+        
+        # Apply position size limits from config
+        min_size = self.config.get('risk_management', {}).get('position_sizing', {}).get('min_position_size', 0.005)
+        max_size = self.config.get('risk_management', {}).get('position_sizing', {}).get('max_position_size', 5.0)
+        
+        return max(min_size, min(quantity, max_size))
+    
     async def _execute_trade(self, signal: Dict, timestamp: datetime, 
                            current_equity: float) -> Optional[TradeResult]:
         """Execute single trade with transaction costs"""
+        
+        # Calculate position size
+        signal.quantity = self._calculate_position_size(signal, current_equity)
         
         # Calculate commission
         commission = self._calculate_commission(signal)
@@ -312,37 +398,37 @@ class BacktestEngine:
         
         # Adjust prices for slippage
         if signal['direction'] == 'long':
-            entry_price = signal['entry_price'] * (1 + slippage)
+            entry_price = signal.entry_price * (1 + slippage)
             exit_price = signal['take_profit'] * (1 - slippage)
             stop_price = signal['stop_loss'] * (1 - slippage)
         else:
-            entry_price = signal['entry_price'] * (1 - slippage)
+            entry_price = signal.entry_price * (1 - slippage)
             exit_price = signal['take_profit'] * (1 + slippage)
             stop_price = signal['stop_loss'] * (1 + slippage)
         
         # Calculate profit
         if signal['direction'] == 'long':
-            profit = (exit_price - entry_price) * signal['quantity'] - commission
+            profit = (exit_price - entry_price) * signal.quantity - commission
         else:
-            profit = (entry_price - exit_price) * signal['quantity'] - commission
+            profit = (entry_price - exit_price) * signal.quantity - commission
         
         # Calculate R-multiple
-        risk = abs(entry_price - stop_price) * signal['quantity']
+        risk = abs(entry_price - stop_price) * signal.quantity
         r_multiple = profit / risk if risk > 0 else 0
         
         # Create trade record
         trade = TradeResult(
             trade_id=self._generate_trade_id(signal, timestamp),
             timestamp=timestamp,
-            symbol=signal['symbol'],
+            symbol=signal.symbol,
             direction=signal['direction'],
             entry_price=entry_price,
             exit_price=exit_price,
-            quantity=signal['quantity'],
+            quantity=signal.quantity,
             commission=commission,
             slippage=slippage * 10000,  # Convert to bps
             profit=profit,
-            profit_pips=self._calculate_pips(entry_price, exit_price, signal['symbol']),
+            profit_pips=self._calculate_pips(entry_price, exit_price, signal.symbol),
             r_multiple=r_multiple,
             entry_time=timestamp,
             exit_time=timestamp + timedelta(hours=1),  # Simplified
@@ -357,10 +443,16 @@ class BacktestEngine:
     
     def _calculate_commission(self, signal: Dict) -> float:
         """Calculate transaction commission"""
-        instrument = self._get_instrument_type(signal['symbol'])
-        commission_rate = self.config.commission.get(instrument, 0.0001)
+        instrument = self._get_instrument_type(signal.symbol)
+        # Handle case where commission is a float instead of dict
+        if isinstance(self.config.commission, float):
+            commission_rate = self.config.commission
+        elif isinstance(self.config.commission, dict):
+            commission_rate = self.config.commission.get(instrument, 0.0001)
+        else:
+            commission_rate = 0.0001
         
-        notional = signal['entry_price'] * signal['quantity']
+        notional = signal.entry_price * signal.quantity
         return notional * commission_rate
     
     def _calculate_slippage(self, signal: Dict) -> float:
@@ -369,7 +461,7 @@ class BacktestEngine:
             return self.config.market_impact_params.get('base_impact', 0.0001)
         
         elif self.config.slippage_model == 'percentage':
-            return signal['entry_price'] * 0.0001
+            return signal.entry_price * 0.0001
         
         elif self.config.slippage_model == 'market_impact':
             # Almgren-Chriss market impact model
@@ -378,7 +470,7 @@ class BacktestEngine:
             volume_factor = params.get('volume_impact_factor', 0.5)
             
             # Simplified impact calculation
-            impact = base_impact * (1 + volume_factor * np.log(signal['quantity'] + 1))
+            impact = base_impact * (1 + volume_factor * np.log(signal.quantity + 1))
             return impact
         
         return 0.0001
@@ -972,7 +1064,7 @@ class BacktestEngine:
     
     def _generate_trade_id(self, signal: Dict, timestamp: datetime) -> str:
         """Generate unique trade ID"""
-        unique_str = f"{signal['symbol']}_{timestamp}_{signal.get('direction', '')}_{np.random.random()}"
+        unique_str = f"{signal.symbol}_{timestamp}_{signal.get('direction', '')}_{np.random.random()}"
         return hashlib.md5(unique_str.encode()).hexdigest()[:12]
     
     def save_results(self, path: Optional[Path] = None):

@@ -79,6 +79,7 @@ class TradingSignal:
     confidence: float
     regime: MarketRegime
     regime_confidence: float
+    quantity: float = 0.0
     
     # SMC components
     order_block: Optional[Dict] = None
@@ -896,16 +897,16 @@ class StrategyEngine:
             signal = TradingSignal(
                 timestamp=df.index[-1],
                 symbol='default',
-                direction=signal_data['direction'],
+                direction=signal_data.direction,
                 signal_type=SignalType.CONTRARIAN,
-                entry_price=signal_data['entry_zone'][0],
-                stop_loss=signal_data['stop_loss'],
-                take_profit=signal_data['take_profit'],
-                risk_reward=signal_data['risk_reward'],
-                confidence=signal_data['confidence'],
+                entry_price=signal_data.entry_zone[0],
+                stop_loss=signal_data.stop_loss,
+                take_profit=signal_data.take_profit,
+                risk_reward=signal_data.risk_reward,
+                confidence=signal_data.confidence,
                 regime=regime,
                 regime_confidence=0.8,
-                confluences=signal_data['structure_confluence'],
+                confluences=signal_data.structure_confluence,
                 contrarian=True
             )
             signals.append(signal)
