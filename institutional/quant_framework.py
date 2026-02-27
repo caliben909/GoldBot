@@ -505,6 +505,11 @@ class GoldInstitutionalFramework:
             elif pd.Timestamp('16:00:00').time() <= current_time < pd.Timestamp('23:59:59').time():
                 session = "ny"
             
+            # EURUSD should ONLY trade during New York session to mark Asia and London high/low
+            if symbol == "EURUSD" and session != "ny":
+                logger.debug(f"EURUSD only trades during New York session, skipping {session} session")
+                return result
+            
             # Calculate macro score from actual data
             # Determine DXY trend
             if len(dxy_data) > 5:
@@ -548,9 +553,13 @@ class GoldInstitutionalFramework:
             result['confidence_score'] = confidence
             
             # Higher confidence threshold to reduce losing trades
-            min_confidence = 7.0
-            if session == "ny":
-                min_confidence = 8.0
+            min_confidence = 8.5
+            if session == "london":
+                min_confidence = 8.5  # Medium confidence for London session
+            elif session == "ny":
+                min_confidence = 9.0  # High confidence for NY session
+            elif session == "asian":
+                min_confidence = 8.0  # Slightly lower confidence for Asian session
                 
             if confidence < min_confidence:
                 logger.debug(f"Confidence score too low: {confidence:.2f}, skipping trade")
@@ -572,20 +581,24 @@ class GoldInstitutionalFramework:
             entry_price = self.calculate_entry_level(df, session_event, macro_bias)
             stop_loss = self.calculate_stop_loss(df, session_event, macro_bias)
             
-            # Adjust risk-reward based on session
+            # Adjust risk-reward based on session and symbol
             risk_reward = 2.5
             if session == "ny":
                 risk_reward = 2.0
-                
+            if symbol == "XAUUSD":
+                risk_reward = 3.0  # Higher RR for Gold to compensate for volatility
+            
             take_profit = self.calculate_take_profit(entry_price, stop_loss, risk_reward)
             
-            # Calculate risk management - smaller risk for NY session
+            # Calculate risk management - smaller risk for Gold due to volatility
             drawdown = 0
             consecutive_losses = 0
             risk_amount = self.calculate_adaptive_risk(confidence, equity, drawdown,
                                                      self.trade_count, consecutive_losses)
             
-            if session == "ny":
+            if symbol == "XAUUSD":
+                risk_amount *= 0.5  # Reduce risk by 50% for Gold
+            elif session == "ny":
                 risk_amount *= 0.7  # Reduce risk by 30% for NY session
             
             position_size = self.calculate_position_size(risk_amount, entry_price, stop_loss)
