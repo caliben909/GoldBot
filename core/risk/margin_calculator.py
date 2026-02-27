@@ -1,854 +1,858 @@
 """
-Advanced Margin Calculator - Exchange-specific margin calculations
+Margin Calculator v2.0 - Production-Ready Implementation
+Optimized for MetaTrader 5 Forex Trading
+Features: Real-time margin monitoring, liquidation prevention, position sizing
 """
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
+from enum import Enum
 import logging
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
-import math
-import warnings
 
-warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 
+class MarginMode(Enum):
+    STANDARD = "standard"  # Standard forex lot sizing
+    MINI = "mini"          # Mini lots (0.1)
+    MICRO = "micro"        # Micro lots (0.01)
+    NANO = "nano"          # Nano lots (0.001)
+
+
 @dataclass
-class MarginConfig:
-    """Configuration for margin calculations"""
-    # Leverage settings
-    max_leverage: int = 100
-    default_leverage: int = 10
-    
-    # Risk parameters
-    margin_of_safety: float = 1.5
-    liquidation_buffer: float = 0.1
-    maintenance_margin_ratio: float = 0.005
-    
-    # Portfolio margin settings
-    portfolio_margin_enabled: bool = False
-    portfolio_margin_threshold: float = 0.05
-    
-    # Margin modes
-    margin_mode: str = 'cross'  # 'cross', 'isolated'
-    
-    # Exchange-specific settings
-    binance_margin_mode: str = 'cross'
-    binance_initial_margin_rate: float = 0.01
-    binance_maintenance_margin_rate: float = 0.005
-    
-    mt5_margin_calculator: str = 'standard'  # 'standard', 'fifo', 'hedged'
-    mt5_initial_margin_rate: float = 0.01
-    mt5_maintenance_margin_rate: float = 0.005
-    
-    # Fee structures
-    exchange_fees: Dict[str, float] = field(default_factory=dict)
-    maker_fees: Dict[str, float] = field(default_factory=dict)
-    taker_fees: Dict[str, float] = field(default_factory=dict)
-    
-    # Margin reporting
-    margin_reporting_enabled: bool = True
-    margin_reporting_frequency: int = 300  # seconds
+class SymbolSpecs:
+    """Symbol specifications for margin calculation"""
+    symbol: str
+    contract_size: float = 100000  # Standard forex lot
+    margin_currency: str = "USD"
+    profit_currency: str = "USD"
+    swap_long: float = 0.0
+    swap_short: float = 0.0
+    point_size: float = 0.0001  # 1 pip for most pairs
+    digits: int = 5
+    trade_calc_mode: int = 0  # 0=Forex, 1=CFD, 2=Futures, etc.
 
 
 @dataclass
 class PositionMargin:
-    """Position-specific margin requirements"""
+    """Position margin and risk metrics"""
     symbol: str
-    quantity: float
+    direction: str  # 'long' or 'short'
+    quantity: float  # Lot size
     entry_price: float
     current_price: float
-    direction: str  # 'long' or 'short'
     
+    # Margin metrics
     initial_margin: float
-    maintenance_margin: float
     used_margin: float
-    available_margin: float
-    margin_ratio: float
-    margin_level: float
+    maintenance_margin: float
     
-    liquidation_price: float
-    bankruptcy_price: float
-    margin_call_price: float
-    
-    leverage: float
-    effective_leverage: float
-    
-    mark_price: float
+    # Risk metrics
     unrealized_pnl: float
-    realized_pnl: float
+    unrealized_pnl_pips: float
+    margin_level: float  # Equity / Used Margin * 100
     
-    funding_fee: float
-    position_funding_rate: float
-    next_funding_time: Optional[datetime] = None
+    # Liquidation levels
+    liquidation_price: float
+    margin_call_price: float
+    stop_out_price: float
+    
+    # Distance metrics
+    distance_to_liquidation_pips: float
+    distance_to_margin_call_pips: float
+    
+    # Swap
+    daily_swap: float
 
 
 @dataclass
-class PortfolioMargin:
-    """Portfolio-level margin requirements"""
-    account_balance: float
+class AccountMargin:
+    """Account-level margin status"""
+    balance: float
     equity: float
-    margin_balance: float
     used_margin: float
-    available_margin: float
-    margin_ratio: float
-    margin_level: float
+    free_margin: float
     
-    initial_margin: float
-    maintenance_margin: float
+    margin_level: float  # Percentage
+    margin_call_level: float  # Percentage threshold
+    stop_out_level: float  # Percentage threshold
     
-    liquidation_threshold: float
-    margin_call_level: float
+    total_unrealized_pnl: float
+    total_daily_swap: float
     
     positions: List[PositionMargin]
-    position_margins: Dict[str, PositionMargin]
     
-    max_leverage: float
-    effective_leverage: float
-    
-    funding_rate: float
-    premium_index: float
-    next_funding_time: Optional[datetime] = None
+    # Risk status
+    status: str  # 'safe', 'warning', 'margin_call', 'stop_out'
+    risk_percentage: float  # How close to stop_out (0-100)
 
 
 class MarginCalculator:
     """
-    Advanced margin calculator with exchange-specific calculations
+    Production-ready margin calculator for MT5 forex trading
     
     Features:
-    - Exchange-specific margin algorithms
-    - Portfolio margin calculations
-    - Leverage management
+    - Accurate MT5-style margin calculations
+    - Real-time margin level monitoring
     - Liquidation price calculation
-    - Margin call alerts
-    - Funding fee calculations
+    - Position size optimization
+    - Multi-currency support
     """
     
-    def __init__(self, config: dict):
-        self.config = MarginConfig(**config['risk_management']['margin'])
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
         
-        # Exchange fee structures
-        self._initialize_exchange_fees()
+        # Default settings
+        self.leverage = self.config.get('leverage', 30)  # 1:30 default
+        self.margin_call_level = self.config.get('margin_call_level', 100)  # 100%
+        self.stop_out_level = self.config.get('stop_out_level', 50)  # 50%
+        self.account_currency = self.config.get('account_currency', 'USD')
         
-        logger.info("MarginCalculator initialized")
+        # Symbol specifications cache
+        self.symbol_specs: Dict[str, SymbolSpecs] = {}
+        
+        # Current market prices
+        self.current_prices: Dict[str, float] = {}
+        self.price_history: Dict[str, List[float]] = {}
+        
+        logger.info(f"MarginCalculator initialized (leverage={self.leverage}:1)")
     
-    def _initialize_exchange_fees(self):
-        """Initialize exchange fee structures"""
-        # Set default fees if not provided
-        if not self.config.exchange_fees:
-            self.config.exchange_fees = {
-                'binance': 0.001,
-                'binance_futures': 0.0004,
-                'mt5': 0.0002,
-                'ccxt': 0.001
-            }
-        
-        if not self.config.maker_fees:
-            self.config.maker_fees = {
-                'binance': 0.001,
-                'binance_futures': 0.0002,
-                'mt5': 0.0001,
-                'ccxt': 0.001
-            }
-        
-        if not self.config.taker_fees:
-            self.config.taker_fees = {
-                'binance': 0.001,
-                'binance_futures': 0.0004,
-                'mt5': 0.0002,
-                'ccxt': 0.001
-            }
+    def set_symbol_specs(self, symbol: str, specs: SymbolSpecs):
+        """Set specifications for a symbol"""
+        self.symbol_specs[symbol] = specs
     
-    async def calculate_position_margin(self, position: Dict, 
-                                       exchange: str = 'binance',
-                                       exchange_info: Optional[Dict] = None) -> PositionMargin:
+    def update_price(self, symbol: str, price: float):
+        """Update current market price"""
+        self.current_prices[symbol] = price
+        
+        # Keep price history for volatility calc
+        if symbol not in self.price_history:
+            self.price_history[symbol] = []
+        self.price_history[symbol].append(price)
+        
+        # Keep last 100 prices
+        if len(self.price_history[symbol]) > 100:
+            self.price_history[symbol] = self.price_history[symbol][-100:]
+    
+    def calculate_position_margin(self, symbol: str, quantity: float,
+                                  entry_price: float, direction: str,
+                                  current_price: Optional[float] = None) -> PositionMargin:
         """
-        Calculate position margin requirements
+        Calculate complete margin metrics for a position
         
         Args:
-            position: Position dictionary with quantity, price, direction
-            exchange: Exchange type
-            exchange_info: Exchange-specific information
+            symbol: Trading symbol (e.g., 'EURUSD')
+            quantity: Position size in lots
+            entry_price: Entry price
+            direction: 'long' or 'short'
+            current_price: Current price (optional, uses entry if not provided)
             
         Returns:
-            PositionMargin object
+            PositionMargin with all metrics
         """
-        if exchange == 'binance' or exchange == 'binance_futures':
-            return await self._calculate_binance_position_margin(position, exchange, exchange_info)
-        elif exchange == 'mt5':
-            return await self._calculate_mt5_position_margin(position, exchange_info)
-        else:
-            return await self._calculate_generic_position_margin(position)
-    
-    async def _calculate_binance_position_margin(self, position: Dict, 
-                                                exchange: str = 'binance',
-                                                exchange_info: Optional[Dict] = None) -> PositionMargin:
-        """Calculate Binance-specific margin requirements"""
-        symbol = position['symbol']
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        current_price = position['current_price']
-        direction = position['direction']
+        if current_price is None:
+            current_price = self.current_prices.get(symbol, entry_price)
         
-        # Get symbol specifications
-        symbol_specs = self._get_binance_symbol_specs(symbol, exchange_info)
-        
-        # Calculate mark price
-        mark_price = current_price
+        # Get symbol specs
+        specs = self.symbol_specs.get(symbol, SymbolSpecs(symbol=symbol))
         
         # Calculate notional value
-        notional_value = abs(quantity) * mark_price
+        notional_value = quantity * specs.contract_size * entry_price
         
-        # Determine margin mode
-        margin_mode = self.config.binance_margin_mode
+        # Calculate margin (MT5 style)
+        # Margin = Notional / Leverage
+        initial_margin = notional_value / self.leverage
         
-        # Calculate initial margin
-        if exchange == 'binance_futures':
-            # Futures margin calculation
-            if margin_mode == 'cross':
-                # Cross margin: uses all available margin
-                initial_margin = notional_value * self.config.binance_initial_margin_rate
-            else:
-                # Isolated margin: initial margin is fixed
-                initial_margin = notional_value * (1 / self.config.max_leverage)
-        else:
-            # Spot margin calculation
-            initial_margin = notional_value * (1 / self.config.default_leverage)
-        
-        # Calculate maintenance margin
-        maintenance_margin = notional_value * self.config.binance_maintenance_margin_rate
-        
-        # Calculate used margin
+        # Used margin is the same for forex (no maintenance margin separation)
         used_margin = initial_margin
         
-        # Calculate PnL
-        unrealized_pnl = 0.0
-        
+        # Calculate unrealized PnL
         if direction == 'long':
-            unrealized_pnl = quantity * (mark_price - entry_price)
+            unrealized_pnl = quantity * specs.contract_size * (current_price - entry_price)
+            # For pairs where USD is quote currency (EURUSD, GBPUSD)
+            # PnL is already in USD
         else:
-            unrealized_pnl = quantity * (entry_price - mark_price)
+            unrealized_pnl = quantity * specs.contract_size * (entry_price - current_price)
         
-        realized_pnl = position.get('realized_pnl', 0.0)
+        # Convert to pips
+        price_diff = current_price - entry_price
+        if direction == 'short':
+            price_diff = -price_diff
+        
+        # Handle JPY pairs (3 decimal places)
+        if 'JPY' in symbol:
+            unrealized_pnl_pips = price_diff / 0.001
+        else:
+            unrealized_pnl_pips = price_diff / 0.0001
         
         # Calculate liquidation price
-        liquidation_price = await self._calculate_binance_liquidation_price(
-            position,
-            mark_price,
-            initial_margin,
-            maintenance_margin,
-            margin_mode,
-            symbol_specs
-        )
+        # Formula: Liquidation when Equity = Used Margin * StopOut%
+        # Equity = Balance + Unrealized PnL
+        # At liquidation: Balance + Unrealized PnL = Used Margin * (StopOut/100)
         
-        # Calculate bankruptcy price
-        bankruptcy_price = self._calculate_binance_bankruptcy_price(
-            position,
-            mark_price,
-            maintenance_margin,
-            margin_mode
-        )
+        # For a position: Unrealized PnL = (Current - Entry) * Quantity * ContractSize
+        # At liquidation: Balance + ((LiquidPrice - Entry) * Q * CS) = UsedMargin * 0.5
         
-        # Calculate margin call price
-        margin_call_price = await self._calculate_binance_margin_call_price(
-            position,
-            mark_price,
-            initial_margin,
-            maintenance_margin,
-            margin_mode
-        )
+        # Simplified: Assuming this is the only position and balance = used_margin initially
+        # Liquidation when loss = 50% of used margin
         
-        # Calculate funding fee
-        funding_fee = await self._calculate_binance_funding_fee(position)
-        
-        return PositionMargin(
-            symbol=symbol,
-            quantity=quantity,
-            entry_price=entry_price,
-            current_price=current_price,
-            direction=direction,
-            initial_margin=initial_margin,
-            maintenance_margin=maintenance_margin,
-            used_margin=used_margin,
-            available_margin=0.0,  # Will be calculated at portfolio level
-            margin_ratio=initial_margin / notional_value,
-            margin_level=(initial_margin + unrealized_pnl) / initial_margin if initial_margin > 0 else 0,
-            liquidation_price=liquidation_price,
-            bankruptcy_price=bankruptcy_price,
-            margin_call_price=margin_call_price,
-            leverage=self.config.default_leverage,
-            effective_leverage=notional_value / initial_margin if initial_margin > 0 else 0,
-            mark_price=mark_price,
-            unrealized_pnl=unrealized_pnl,
-            realized_pnl=realized_pnl,
-            funding_fee=funding_fee,
-            position_funding_rate=symbol_specs.get('funding_rate', 0.0),
-            next_funding_time=symbol_specs.get('next_funding_time')
-        )
-    
-    async def _calculate_mt5_position_margin(self, position: Dict, 
-                                            exchange_info: Optional[Dict] = None) -> PositionMargin:
-        """Calculate MT5-specific margin requirements"""
-        symbol = position['symbol']
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        current_price = position['current_price']
-        direction = position['direction']
-        
-        # Get symbol specifications
-        symbol_specs = self._get_mt5_symbol_specs(symbol, exchange_info)
-        
-        # Calculate notional value
-        notional_value = abs(quantity) * current_price
-        
-        # Calculate initial margin
-        if symbol_specs['margin_mode'] == 'fxf':  # Forex
-            leverage = self.config.default_leverage
-            initial_margin = notional_value / leverage
-        else:
-            # Other instruments use percentage-based margin
-            initial_margin = notional_value * self.config.mt5_initial_margin_rate
-        
-        # Calculate maintenance margin
-        maintenance_margin = notional_value * self.config.mt5_maintenance_margin_rate
-        
-        # Calculate used margin
-        used_margin = initial_margin
-        
-        # Calculate PnL
-        unrealized_pnl = 0.0
+        max_loss = used_margin * (self.stop_out_level / 100)
         
         if direction == 'long':
-            unrealized_pnl = quantity * (current_price - entry_price)
+            # Price drops to cause max_loss
+            price_drop = max_loss / (quantity * specs.contract_size)
+            liquidation_price = entry_price - price_drop
+            margin_call_price = entry_price - (max_loss * 0.5 / (quantity * specs.contract_size))
+            stop_out_price = liquidation_price
         else:
-            unrealized_pnl = quantity * (entry_price - current_price)
+            # Price rises to cause max_loss
+            price_rise = max_loss / (quantity * specs.contract_size)
+            liquidation_price = entry_price + price_rise
+            margin_call_price = entry_price + (max_loss * 0.5 / (quantity * specs.contract_size))
+            stop_out_price = liquidation_price
         
-        realized_pnl = position.get('realized_pnl', 0.0)
+        # Calculate distances
+        if 'JPY' in symbol:
+            pip_size = 0.001
+        else:
+            pip_size = 0.0001
         
-        # Calculate liquidation price
-        liquidation_price = await self._calculate_mt5_liquidation_price(
-            position,
-            current_price,
-            initial_margin,
-            maintenance_margin
-        )
+        if direction == 'long':
+            distance_to_liquidation = (current_price - liquidation_price) / pip_size
+            distance_to_margin_call = (current_price - margin_call_price) / pip_size
+        else:
+            distance_to_liquidation = (liquidation_price - current_price) / pip_size
+            distance_to_margin_call = (margin_call_price - current_price) / pip_size
         
-        return PositionMargin(
-            symbol=symbol,
-            quantity=quantity,
-            entry_price=entry_price,
-            current_price=current_price,
-            direction=direction,
-            initial_margin=initial_margin,
-            maintenance_margin=maintenance_margin,
-            used_margin=used_margin,
-            available_margin=0.0,
-            margin_ratio=initial_margin / notional_value,
-            margin_level=(initial_margin + unrealized_pnl) / initial_margin if initial_margin > 0 else 0,
-            liquidation_price=liquidation_price,
-            bankruptcy_price=liquidation_price,
-            margin_call_price=await self._calculate_mt5_margin_call_price(
-                position, current_price, initial_margin, maintenance_margin
-            ),
-            leverage=self.config.default_leverage,
-            effective_leverage=notional_value / initial_margin if initial_margin > 0 else 0,
-            mark_price=current_price,
-            unrealized_pnl=unrealized_pnl,
-            realized_pnl=realized_pnl,
-            funding_fee=0.0,
-            position_funding_rate=0.0
-        )
-    
-    async def _calculate_generic_position_margin(self, position: Dict) -> PositionMargin:
-        """Calculate generic margin requirements for other exchanges"""
-        symbol = position['symbol']
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        current_price = position['current_price']
-        direction = position['direction']
+        # Calculate daily swap
+        if direction == 'long':
+            daily_swap = quantity * specs.contract_size * specs.swap_long
+        else:
+            daily_swap = quantity * specs.contract_size * specs.swap_short
         
-        notional_value = abs(quantity) * current_price
-        
-        initial_margin = notional_value * self.config.margin_of_safety
-        maintenance_margin = notional_value * self.config.maintenance_margin_ratio
-        
-        unrealized_pnl = quantity * (current_price - entry_price) if direction == 'long' else \
-                       quantity * (entry_price - current_price)
-        
-        liquidation_price = await self._calculate_generic_liquidation_price(
-            position,
-            current_price,
-            initial_margin,
-            maintenance_margin
-        )
+        # Calculate margin level (will be updated at account level)
+        margin_level = 0.0  # Placeholder, calculated at account level
         
         return PositionMargin(
             symbol=symbol,
+            direction=direction,
             quantity=quantity,
             entry_price=entry_price,
             current_price=current_price,
-            direction=direction,
             initial_margin=initial_margin,
-            maintenance_margin=maintenance_margin,
-            used_margin=initial_margin,
-            available_margin=0.0,
-            margin_ratio=initial_margin / notional_value,
-            margin_level=(initial_margin + unrealized_pnl) / initial_margin if initial_margin > 0 else 0,
-            liquidation_price=liquidation_price,
-            bankruptcy_price=liquidation_price,
-            margin_call_price=liquidation_price * 1.05,  # 5% buffer
-            leverage=self.config.default_leverage,
-            effective_leverage=notional_value / initial_margin if initial_margin > 0 else 0,
-            mark_price=current_price,
-            unrealized_pnl=unrealized_pnl,
-            realized_pnl=0.0,
-            funding_fee=0.0,
-            position_funding_rate=0.0
-        )
-    
-    async def calculate_portfolio_margin(self, positions: List[Dict], 
-                                        account_info: Dict,
-                                        exchange: str = 'binance',
-                                        exchange_info: Optional[Dict] = None) -> PortfolioMargin:
-        """
-        Calculate portfolio-level margin requirements
-        
-        Args:
-            positions: List of positions
-            account_info: Account information
-            exchange: Exchange type
-            exchange_info: Exchange-specific information
-            
-        Returns:
-            PortfolioMargin object
-        """
-        position_margins = []
-        
-        for pos in positions:
-            pos_margin = await self.calculate_position_margin(pos, exchange, exchange_info)
-            position_margins.append(pos_margin)
-        
-        # Calculate total used margin
-        used_margin = sum(pos.used_margin for pos in position_margins)
-        
-        # Calculate equity
-        account_balance = account_info.get('balance', 0.0)
-        unrealized_pnl = sum(pos.unrealized_pnl for pos in position_margins)
-        equity = account_balance + unrealized_pnl
-        
-        # Calculate available margin
-        available_margin = equity - used_margin
-        
-        # Calculate initial margin
-        initial_margin = sum(pos.initial_margin for pos in position_margins)
-        
-        # Calculate maintenance margin
-        maintenance_margin = sum(pos.maintenance_margin for pos in position_margins)
-        
-        # Calculate margin ratio and level
-        margin_ratio = used_margin / equity if equity > 0 else 0
-        margin_level = equity / used_margin if used_margin > 0 else 0
-        
-        # Calculate portfolio leverage
-        total_notional = sum(abs(pos.quantity * pos.mark_price) for pos in position_margins)
-        max_leverage = self.config.max_leverage
-        effective_leverage = total_notional / equity if equity > 0 else 0
-        
-        # Calculate funding rate and next funding time
-        funding_rate = 0.0
-        next_funding_time = None
-        
-        if exchange == 'binance_futures':
-            funding_rate = await self._calculate_binance_portfolio_funding_rate(positions, exchange_info)
-            next_funding_time = await self._get_next_binance_funding_time(exchange_info)
-        
-        # Check for margin call and liquidation levels
-        margin_call_level = 0.0
-        liquidation_threshold = 0.0
-        
-        if exchange == 'binance' or exchange == 'binance_futures':
-            margin_call_level = 1.1  # 110% margin level
-            liquidation_threshold = 0.8  # 80% margin level
-        elif exchange == 'mt5':
-            margin_call_level = 1.2  # 120% margin level
-            liquidation_threshold = 0.9  # 90% margin level
-        
-        return PortfolioMargin(
-            account_balance=account_balance,
-            equity=equity,
-            margin_balance=account_balance,
             used_margin=used_margin,
-            available_margin=available_margin,
-            margin_ratio=margin_ratio,
+            maintenance_margin=used_margin * 0.5,  # 50% for MT5
+            unrealized_pnl=unrealized_pnl,
+            unrealized_pnl_pips=unrealized_pnl_pips,
             margin_level=margin_level,
-            initial_margin=initial_margin,
-            maintenance_margin=maintenance_margin,
-            liquidation_threshold=liquidation_threshold,
-            margin_call_level=margin_call_level,
-            positions=positions,
-            position_margins={pos.symbol: pos for pos in position_margins},
-            max_leverage=max_leverage,
-            effective_leverage=effective_leverage,
-            funding_rate=funding_rate,
-            premium_index=0.0,
-            next_funding_time=next_funding_time
+            liquidation_price=liquidation_price,
+            margin_call_price=margin_call_price,
+            stop_out_price=stop_out_price,
+            distance_to_liquidation_pips=distance_to_liquidation,
+            distance_to_margin_call_pips=distance_to_margin_call,
+            daily_swap=daily_swap
         )
     
-    async def _calculate_binance_liquidation_price(self, position: Dict,
-                                                 mark_price: float,
-                                                 initial_margin: float,
-                                                 maintenance_margin: float,
-                                                 margin_mode: str,
-                                                 symbol_specs: Dict) -> float:
-        """Calculate Binance liquidation price"""
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        direction = position['direction']
+    def calculate_account_margin(self, balance: float,
+                                  positions: List[Dict],
+                                  current_prices: Optional[Dict[str, float]] = None) -> AccountMargin:
+        """
+        Calculate account-level margin status
         
-        # Binance futures liquidation formula
-        if direction == 'long':
-            liquidation_price = entry_price * (
-                1 - (1 / self.config.default_leverage) + self.config.maintenance_margin_rate
-            )
-        else:
-            liquidation_price = entry_price * (
-                1 + (1 / self.config.default_leverage) - self.config.maintenance_margin_rate
-            )
+        Args:
+            balance: Account balance
+            positions: List of position dicts with symbol, quantity, entry_price, direction
+            current_prices: Dict of symbol -> current price
+            
+        Returns:
+            AccountMargin with complete status
+        """
+        if current_prices:
+            self.current_prices.update(current_prices)
         
-        return liquidation_price
-    
-    def _calculate_binance_bankruptcy_price(self, position: Dict,
-                                           mark_price: float,
-                                           maintenance_margin: float,
-                                           margin_mode: str) -> float:
-        """Calculate Binance bankruptcy price"""
-        return mark_price * (1 - maintenance_margin)
-    
-    async def _calculate_binance_margin_call_price(self, position: Dict,
-                                                 mark_price: float,
-                                                 initial_margin: float,
-                                                 maintenance_margin: float,
-                                                 margin_mode: str) -> float:
-        """Calculate Binance margin call price"""
-        return mark_price * 1.05
-    
-    async def _calculate_mt5_liquidation_price(self, position: Dict,
-                                               current_price: float,
-                                               initial_margin: float,
-                                               maintenance_margin: float) -> float:
-        """Calculate MT5 liquidation price"""
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        direction = position['direction']
-        
-        # MT5 liquidation formula
-        if direction == 'long':
-            liquidation_price = entry_price - (initial_margin / quantity)
-        else:
-            liquidation_price = entry_price + (initial_margin / quantity)
-        
-        return liquidation_price
-    
-    async def _calculate_mt5_margin_call_price(self, position: Dict,
-                                               current_price: float,
-                                               initial_margin: float,
-                                               maintenance_margin: float) -> float:
-        """Calculate MT5 margin call price"""
-        return current_price * 1.03
-    
-    async def _calculate_generic_liquidation_price(self, position: Dict,
-                                                 current_price: float,
-                                                 initial_margin: float,
-                                                 maintenance_margin: float) -> float:
-        """Calculate generic liquidation price"""
-        quantity = position['quantity']
-        entry_price = position['avg_entry_price']
-        direction = position['direction']
-        
-        if direction == 'long':
-            liquidation_price = entry_price - (initial_margin / quantity)
-        else:
-            liquidation_price = entry_price + (initial_margin / quantity)
-        
-        return liquidation_price
-    
-    async def _calculate_binance_funding_fee(self, position: Dict) -> float:
-        """Calculate Binance funding fee"""
-        quantity = abs(position['quantity'])
-        funding_rate = position.get('funding_rate', 0.0)
-        mark_price = position['current_price']
-        
-        if funding_rate == 0.0:
-            return 0.0
-        
-        # Funding fee = position value * funding rate
-        return quantity * mark_price * funding_rate
-    
-    async def _calculate_binance_portfolio_funding_rate(self, positions: List[Dict],
-                                                      exchange_info: Optional[Dict]) -> float:
-        """Calculate average funding rate for portfolio"""
-        total_funding = 0.0
-        total_notional = 0.0
+        # Calculate each position
+        position_margins = []
+        total_used_margin = 0.0
+        total_unrealized_pnl = 0.0
+        total_daily_swap = 0.0
         
         for pos in positions:
-            if 'funding_rate' in pos and pos['funding_rate'] is not None:
-                notional = abs(pos['quantity'] * pos['current_price'])
-                funding = pos['funding_rate'] * notional
-                total_funding += funding
-                total_notional += notional
-        
-        if total_notional > 0:
-            return total_funding / total_notional
-        
-        return 0.0
-    
-    async def _get_next_binance_funding_time(self, exchange_info: Optional[Dict]) -> Optional[datetime]:
-        """Get next funding time"""
-        if not exchange_info or 'next_funding_time' not in exchange_info:
-            # Default to next 8-hour interval
-            now = datetime.now()
-            next_funding = now.replace(hour=(now.hour // 8 + 1) * 8, minute=0, second=0, microsecond=0)
+            pm = self.calculate_position_margin(
+                symbol=pos['symbol'],
+                quantity=pos['quantity'],
+                entry_price=pos['entry_price'],
+                direction=pos['direction'],
+                current_price=self.current_prices.get(pos['symbol'])
+            )
             
-            if next_funding <= now:
-                next_funding += timedelta(hours=8)
-            
-            return next_funding
+            position_margins.append(pm)
+            total_used_margin += pm.used_margin
+            total_unrealized_pnl += pm.unrealized_pnl
+            total_daily_swap += pm.daily_swap
         
-        return exchange_info['next_funding_time']
-    
-    def _get_binance_symbol_specs(self, symbol: str,
-                                  exchange_info: Optional[Dict] = None) -> Dict:
-        """Get Binance symbol specifications"""
-        if exchange_info and 'symbols' in exchange_info:
-            for sym in exchange_info['symbols']:
-                if sym['symbol'] == symbol:
-                    return sym
+        # Calculate equity and free margin
+        equity = balance + total_unrealized_pnl
+        free_margin = equity - total_used_margin
         
-        # Default specifications
-        return {
-            'leverage_bracket': 1,
-            'max_leverage': self.config.max_leverage,
-            'initial_margin_rate': self.config.binance_initial_margin_rate,
-            'maintenance_margin_rate': self.config.binance_maintenance_margin_rate,
-            'funding_rate': 0.0,
-            'next_funding_time': None
-        }
-    
-    def _get_mt5_symbol_specs(self, symbol: str,
-                             exchange_info: Optional[Dict] = None) -> Dict:
-        """Get MT5 symbol specifications"""
-        if exchange_info and symbol in exchange_info:
-            return exchange_info[symbol]
+        # Calculate margin level
+        if total_used_margin > 0:
+            margin_level = (equity / total_used_margin) * 100
+        else:
+            margin_level = 0.0
         
-        # Default specifications
-        return {
-            'margin_mode': 'fxf',  # Forex
-            'margin_rate': self.config.mt5_initial_margin_rate,
-            'swap_long': 0.0,
-            'swap_short': 0.0
-        }
+        # Determine status
+        if margin_level <= self.stop_out_level:
+            status = 'stop_out'
+            risk_percentage = 100.0
+        elif margin_level <= self.margin_call_level:
+            status = 'margin_call'
+            risk_percentage = ((self.margin_call_level - margin_level) / 
+                             (self.margin_call_level - self.stop_out_level)) * 100
+        elif margin_level <= self.margin_call_level * 1.5:
+            status = 'warning'
+            risk_percentage = 50.0
+        else:
+            status = 'safe'
+            risk_percentage = 0.0
+        
+        return AccountMargin(
+            balance=balance,
+            equity=equity,
+            used_margin=total_used_margin,
+            free_margin=free_margin,
+            margin_level=margin_level,
+            margin_call_level=self.margin_call_level,
+            stop_out_level=self.stop_out_level,
+            total_unrealized_pnl=total_unrealized_pnl,
+            total_daily_swap=total_daily_swap,
+            positions=position_margins,
+            status=status,
+            risk_percentage=risk_percentage
+        )
     
-    async def calculate_trade_margin_requirement(self, symbol: str,
-                                                quantity: float,
-                                                price: float,
-                                                direction: str,
-                                                exchange: str = 'binance',
-                                                exchange_info: Optional[Dict] = None) -> float:
+    def calculate_position_size(self, symbol: str, risk_amount: float,
+                                 stop_loss_pips: float,
+                                 entry_price: Optional[float] = None) -> Dict[str, float]:
         """
-        Calculate margin requirement for a new trade
+        Calculate optimal position size based on risk
+        
+        Args:
+            symbol: Trading symbol
+            risk_amount: Amount to risk in account currency
+            stop_loss_pips: Stop loss distance in pips
+            entry_price: Entry price (optional)
+            
+        Returns:
+            Dict with position size and margin required
+        """
+        if entry_price is None:
+            entry_price = self.current_prices.get(symbol, 1.0)
+        
+        specs = self.symbol_specs.get(symbol, SymbolSpecs(symbol=symbol))
+        
+        # Calculate pip value
+        if 'JPY' in symbol:
+            pip_value = specs.contract_size * 0.001  # 0.001 for JPY pairs
+        else:
+            pip_value = specs.contract_size * 0.0001  # 0.0001 for standard pairs
+        
+        # Calculate position size
+        # Risk = PositionSize * PipValue * StopLossPips
+        # PositionSize = Risk / (PipValue * StopLossPips)
+        
+        total_risk_per_lot = pip_value * stop_loss_pips
+        
+        if total_risk_per_lot == 0:
+            return {
+                'position_size': 0.0,
+                'lots': 0.0,
+                'margin_required': 0.0,
+                'error': 'Invalid stop loss'
+            }
+        
+        position_size = risk_amount / total_risk_per_lot
+        
+        # Round to standard lot sizes
+        if position_size >= 1.0:
+            lots = round(position_size, 2)  # Standard lots, 2 decimal places
+        elif position_size >= 0.1:
+            lots = round(position_size, 2)  # Mini lots
+        else:
+            lots = round(position_size, 3)  # Micro lots
+        
+        # Ensure minimum lot size
+        lots = max(lots, 0.001)  # Minimum 0.001 lot (nano)
+        
+        # Calculate margin required
+        notional = lots * specs.contract_size * entry_price
+        margin_required = notional / self.leverage
+        
+        return {
+            'position_size': lots,
+            'lots': lots,
+            'units': lots * specs.contract_size,
+            'margin_required': margin_required,
+            'notional_value': notional,
+            'risk_amount': risk_amount,
+            'stop_loss_pips': stop_loss_pips,
+            'pip_value': pip_value
+        }
+    
+    def calculate_max_position_size(self, symbol: str, 
+                                     available_margin: Optional[float] = None,
+                                     entry_price: Optional[float] = None) -> float:
+        """
+        Calculate maximum position size based on available margin
+        
+        Args:
+            symbol: Trading symbol
+            available_margin: Available margin (free margin)
+            entry_price: Entry price
+            
+        Returns:
+            Maximum lot size
+        """
+        if entry_price is None:
+            entry_price = self.current_prices.get(symbol, 1.0)
+        
+        if available_margin is None:
+            available_margin = 1000  # Default $1000
+        
+        specs = self.symbol_specs.get(symbol, SymbolSpecs(symbol=symbol))
+        
+        # Max position = (Available Margin * Leverage) / (Contract Size * Price)
+        max_notional = available_margin * self.leverage
+        max_lots = max_notional / (specs.contract_size * entry_price)
+        
+        # Apply safety buffer (use 90% of available margin)
+        max_lots *= 0.9
+        
+        # Round down to safe lot size
+        if max_lots >= 1.0:
+            return round(max_lots - 0.005, 2)  # Round down
+        elif max_lots >= 0.1:
+            return round(max_lots - 0.0005, 2)
+        else:
+            return round(max_lots - 0.00005, 3)
+    
+    def check_margin_for_trade(self, symbol: str, quantity: float,
+                                direction: str, entry_price: float,
+                                account_balance: float,
+                                current_positions: List[Dict]) -> Tuple[bool, str, Dict]:
+        """
+        Check if a new trade can be opened with current margin
         
         Args:
             symbol: Symbol to trade
-            quantity: Quantity to trade
-            price: Entry price
-            direction: Trade direction
-            exchange: Exchange type
-            exchange_info: Exchange-specific information
+            quantity: Lot size
+            direction: 'long' or 'short'
+            entry_price: Entry price
+            account_balance: Current balance
+            current_positions: Existing positions
             
         Returns:
-            Margin required in base currency
+            (can_trade, reason, details) tuple
         """
-        position = {
-            'symbol': symbol,
-            'quantity': quantity,
-            'avg_entry_price': price,
-            'current_price': price,
-            'direction': direction
-        }
+        # Calculate current account state
+        current_state = self.calculate_account_margin(account_balance, current_positions)
         
-        margin = await self.calculate_position_margin(position, exchange, exchange_info)
-        return margin.initial_margin
+        # Calculate new position margin
+        new_position = self.calculate_position_margin(symbol, quantity, entry_price, direction)
+        
+        # Calculate post-trade state
+        new_used_margin = current_state.used_margin + new_position.used_margin
+        new_equity = current_state.equity  # No unrealized PnL yet for new position
+        new_free_margin = new_equity - new_used_margin
+        
+        # Check if we have enough free margin
+        if new_free_margin < 0:
+            return False, "Insufficient free margin", {
+                'required_margin': new_position.used_margin,
+                'available_margin': current_state.free_margin,
+                'shortfall': abs(new_free_margin)
+            }
+        
+        # Check margin level after trade
+        if new_used_margin > 0:
+            new_margin_level = (new_equity / new_used_margin) * 100
+        else:
+            new_margin_level = 0
+        
+        if new_margin_level < self.margin_call_level:
+            return False, f"Margin level would be {new_margin_level:.1f}% (below {self.margin_call_level}%)", {
+                'current_margin_level': current_state.margin_level,
+                'projected_margin_level': new_margin_level
+            }
+        
+        # Check if we're over-leveraged
+        total_notional = sum(
+            pos['quantity'] * self.symbol_specs.get(pos['symbol'], SymbolSpecs(symbol=pos['symbol'])).contract_size * 
+            self.current_prices.get(pos['symbol'], pos['entry_price'])
+            for pos in current_positions
+        ) + (quantity * self.symbol_specs.get(symbol, SymbolSpecs(symbol=symbol)).contract_size * entry_price)
+        
+        effective_leverage = total_notional / account_balance if account_balance > 0 else 0
+        
+        if effective_leverage > self.leverage * 0.9:
+            return False, f"Effective leverage {effective_leverage:.1f}x too high", {
+                'max_leverage': self.leverage,
+                'effective_leverage': effective_leverage
+            }
+        
+        return True, "Trade approved", {
+            'required_margin': new_position.used_margin,
+            'new_margin_level': new_margin_level,
+            'new_free_margin': new_free_margin,
+            'effective_leverage': effective_leverage
+        }
     
-    async def check_margin_requirements(self, portfolio_margin: PortfolioMargin) -> List[Dict]:
+    def get_margin_alerts(self, account_margin: AccountMargin) -> List[Dict]:
         """
-        Check margin requirements and generate alerts
+        Generate margin alerts based on account status
         
         Args:
-            portfolio_margin: Portfolio margin information
+            account_margin: Current account margin status
             
         Returns:
-            List of margin alerts
+            List of alert dictionaries
         """
         alerts = []
         
-        # Check margin level
-        if portfolio_margin.margin_level < portfolio_margin.liquidation_threshold:
+        if account_margin.status == 'stop_out':
             alerts.append({
-                'type': 'liquidation_imminent',
                 'level': 'critical',
-                'message': f"Liquidation imminent! Margin level: {portfolio_margin.margin_level:.1%}",
+                'type': 'stop_out_imminent',
+                'message': f"STOP OUT IMMINENT! Margin level: {account_margin.margin_level:.1f}%",
                 'action': 'Close positions immediately',
-                'suggestion': 'Reduce leverage or add funds'
+                'timestamp': datetime.now()
             })
-        elif portfolio_margin.margin_level < portfolio_margin.margin_call_level:
+        
+        elif account_margin.status == 'margin_call':
             alerts.append({
+                'level': 'high',
                 'type': 'margin_call',
-                'level': 'high',
-                'message': f"Margin call! Margin level: {portfolio_margin.margin_level:.1%}",
+                'message': f"Margin Call! Level: {account_margin.margin_level:.1f}%",
                 'action': 'Close positions or add funds',
-                'suggestion': f"Reduce exposure or deposit at least ${portfolio_margin.used_margin * 0.1:.2f}"
+                'suggestion': f"Deposit at least ${account_margin.used_margin * 0.5:.2f}",
+                'timestamp': datetime.now()
             })
         
-        # Check position margins
-        for symbol, pos_margin in portfolio_margin.position_margins.items():
-            if pos_margin.margin_level < 0.5:
-                alerts.append({
-                    'type': 'position_liquidation',
-                    'level': 'critical',
-                    'symbol': symbol,
-                    'message': f"{symbol} position liquidation imminent! Margin level: {pos_margin.margin_level:.1%}",
-                    'action': 'Close position',
-                    'suggestion': f"Close {symbol} position to reduce risk"
-                })
-            elif pos_margin.margin_level < 1.0:
-                alerts.append({
-                    'type': 'position_margin_warning',
-                    'level': 'medium',
-                    'symbol': symbol,
-                    'message': f"{symbol} position margin level low: {pos_margin.margin_level:.1%}",
-                    'action': 'Consider closing or reducing position',
-                    'suggestion': f"Reduce {symbol} position size by 50%"
-                })
-        
-        # Check leverage
-        if portfolio_margin.effective_leverage > self.config.max_leverage * 0.8:
+        elif account_margin.status == 'warning':
             alerts.append({
-                'type': 'leverage_warning',
                 'level': 'medium',
-                'message': f"Leverage approaching maximum! Current: {portfolio_margin.effective_leverage:.1f}x",
-                'action': 'Reduce leverage',
-                'suggestion': f"Target leverage below {self.config.max_leverage * 0.6:.1f}x"
+                'type': 'margin_warning',
+                'message': f"Margin level low: {account_margin.margin_level:.1f}%",
+                'action': 'Monitor closely',
+                'suggestion': 'Consider reducing position sizes',
+                'timestamp': datetime.now()
             })
         
-        # Check margin usage
-        margin_utilization = portfolio_margin.used_margin / portfolio_margin.equity
-        if margin_utilization > 0.8:
-            alerts.append({
-                'type': 'margin_utilization',
-                'level': 'high',
-                'message': f"Margin utilization very high: {margin_utilization:.1%}",
-                'action': 'Reduce exposure',
-                'suggestion': f"Reduce margin usage to below 50%"
-            })
+        # Check individual positions
+        for pos in account_margin.positions:
+            if pos.distance_to_liquidation_pips < 50:
+                alerts.append({
+                    'level': 'high',
+                    'type': 'position_near_liquidation',
+                    'symbol': pos.symbol,
+                    'message': f"{pos.symbol} {pos.distance_to_liquidation_pips:.0f} pips from liquidation",
+                    'action': f"Close {pos.symbol} or add margin",
+                    'timestamp': datetime.now()
+                })
         
         return alerts
     
-    async def calculate_margin_optimization(self, portfolio_margin: PortfolioMargin) -> List[Dict]:
+    def suggest_position_adjustments(self, account_margin: AccountMargin,
+                                      target_margin_level: float = 200.0) -> List[Dict]:
         """
-        Calculate margin optimization suggestions
+        Suggest position adjustments to improve margin level
         
         Args:
-            portfolio_margin: Portfolio margin information
+            account_margin: Current account margin status
+            target_margin_level: Target margin level percentage
             
         Returns:
-            List of optimization suggestions
+            List of adjustment suggestions
         """
         suggestions = []
         
-        # Calculate available margin
-        available_margin = portfolio_margin.available_margin
+        if account_margin.margin_level >= target_margin_level:
+            return suggestions
         
-        if available_margin < 0:
-            # Negative available margin - need to reduce exposure
-            total_reduction = abs(available_margin)
+        # Calculate how much margin we need to free up
+        current_equity = account_margin.equity
+        target_used_margin = (current_equity / target_margin_level) * 100
+        margin_to_free = account_margin.used_margin - target_used_margin
+        
+        if margin_to_free <= 0:
+            return suggestions
+        
+        # Sort positions by margin used (largest first)
+        sorted_positions = sorted(
+            account_margin.positions,
+            key=lambda x: x.used_margin,
+            reverse=True
+        )
+        
+        freed_margin = 0.0
+        for pos in sorted_positions:
+            if freed_margin >= margin_to_free:
+                break
             
-            # Sort positions by margin utilization
-            sorted_positions = sorted(
-                portfolio_margin.position_margins.items(),
-                key=lambda x: x[1].margin_ratio,
-                reverse=True
-            )
-            
-            for symbol, pos in sorted_positions:
-                if total_reduction <= 0:
-                    break
-                
-                # Calculate how much to reduce this position
-                pos_reduction = min(pos.used_margin, total_reduction)
-                reduction_percentage = pos_reduction / pos.used_margin
-                
-                suggestions.append({
-                    'type': 'position_reduction',
-                    'symbol': symbol,
-                    'current_quantity': pos.quantity,
-                    'suggested_quantity': pos.quantity * (1 - reduction_percentage),
-                    'reduction_amount': pos_reduction,
-                    'rationale': 'Reduce position to restore positive available margin'
-                })
-                
-                total_reduction -= pos_reduction
-        
-        else:
-            # Positive available margin - suggest increasing leverage or adding positions
-            if portfolio_margin.effective_leverage < self.config.max_leverage * 0.5:
-                suggestions.append({
-                    'type': 'leverage_increase',
-                    'current_leverage': portfolio_margin.effective_leverage,
-                    'suggested_leverage': min(portfolio_margin.effective_leverage * 1.5, self.config.max_leverage),
-                    'rationale': 'Available margin suggests room for increased leverage'
-                })
-        
-        # Suggest portfolio margin optimization
-        if self.config.portfolio_margin_enabled and len(portfolio_margin.position_margins) > 3:
+            # Suggest closing this position
             suggestions.append({
-                'type': 'portfolio_margin_optimization',
-                'rationale': 'Consider portfolio margin for better capital efficiency with diverse positions'
+                'action': 'close_position',
+                'symbol': pos.symbol,
+                'current_size': pos.quantity,
+                'margin_freed': pos.used_margin,
+                'unrealized_pnl': pos.unrealized_pnl,
+                'reason': f'Free up {pos.used_margin:.2f} margin'
+            })
+            
+            freed_margin += pos.used_margin
+        
+        # If closing positions isn't enough, suggest deposit
+        if freed_margin < margin_to_free:
+            deposit_needed = (account_margin.used_margin * (target_margin_level / 100)) - account_margin.equity
+            suggestions.append({
+                'action': 'deposit_funds',
+                'amount': deposit_needed,
+                'reason': f'Reach {target_margin_level}% margin level'
             })
         
         return suggestions
+    
+    def get_liquidation_estimate(self, positions: List[Dict],
+                                  account_balance: float,
+                                  price_changes: Dict[str, float]) -> Dict[str, Any]:
+        """
+        Estimate liquidation risk under various price scenarios
+        
+        Args:
+            positions: Current positions
+            account_balance: Account balance
+            price_changes: Dict of symbol -> price change percentage
+            
+        Returns:
+            Liquidation risk assessment
+        """
+        # Apply price changes
+        stressed_prices = {}
+        for pos in positions:
+            symbol = pos['symbol']
+            current = self.current_prices.get(symbol, pos['entry_price'])
+            
+            if symbol in price_changes:
+                stressed_prices[symbol] = current * (1 + price_changes[symbol])
+            else:
+                stressed_prices[symbol] = current
+        
+        # Calculate stressed margin
+        stressed_state = self.calculate_account_margin(account_balance, positions, stressed_prices)
+        
+        return {
+            'current_margin_level': self.calculate_account_margin(account_balance, positions).margin_level,
+            'stressed_margin_level': stressed_state.margin_level,
+            'liquidation_risk': stressed_state.status == 'stop_out',
+            'price_changes': price_changes,
+            'stressed_equity': stressed_state.equity,
+            'stressed_free_margin': stressed_state.free_margin
+        }
 
 
-# Helper functions
-def calculate_position_margin_quick(quantity: float,
-                                   price: float,
-                                   leverage: float,
-                                   margin_rate: float = 0.01) -> float:
-    """Quick position margin calculation"""
-    notional = quantity * price
-    return notional * margin_rate * leverage
+# ============================================================================
+# MT5 INTEGRATION
+# ============================================================================
+
+class MT5MarginMonitor:
+    """
+    Real-time margin monitor for MT5 integration
+    """
+    
+    def __init__(self, calculator: MarginCalculator):
+        self.calculator = calculator
+        self.last_check: Optional[datetime] = None
+        self.check_interval = timedelta(seconds=1)
+        
+        # Alert callbacks
+        self.alert_handlers: List[callable] = []
+    
+    def register_alert_handler(self, handler: callable):
+        """Register callback for margin alerts"""
+        self.alert_handlers.append(handler)
+    
+    def update_from_mt5(self, account_info: Dict, positions: List[Dict]):
+        """
+        Update from MT5 account info
+        
+        Args:
+            account_info: Dict with balance, equity, margin, etc.
+            positions: List of position dicts from MT5
+        """
+        current_time = datetime.now()
+        
+        # Throttle checks
+        if self.last_check and (current_time - self.last_check) < self.check_interval:
+            return
+        
+        self.last_check = current_time
+        
+        # Update prices from positions
+        for pos in positions:
+            self.calculator.update_price(pos['symbol'], pos['current_price'])
+        
+        # Calculate margin status
+        margin_status = self.calculator.calculate_account_margin(
+            balance=account_info.get('balance', 0),
+            positions=positions
+        )
+        
+        # Check for alerts
+        alerts = self.calculator.get_margin_alerts(margin_status)
+        
+        # Trigger callbacks
+        for alert in alerts:
+            for handler in self.alert_handlers:
+                try:
+                    handler(alert)
+                except Exception as e:
+                    logger.error(f"Alert handler error: {e}")
+        
+        return margin_status
+    
+    def get_trade_permission(self, symbol: str, lots: float,
+                            direction: str, mt5_account_info: Dict,
+                            mt5_positions: List[Dict]) -> Tuple[bool, str]:
+        """
+        Check if MT5 should allow a trade
+        
+        Args:
+            symbol: Symbol to trade
+            lots: Lot size
+            direction: 'buy' or 'sell'
+            mt5_account_info: MT5 account info
+            mt5_positions: Current MT5 positions
+            
+        Returns:
+            (allowed, reason) tuple
+        """
+        entry_price = self.calculator.current_prices.get(symbol, 0)
+        
+        can_trade, reason, details = self.calculator.check_margin_for_trade(
+            symbol=symbol,
+            quantity=lots,
+            direction='long' if direction == 'buy' else 'short',
+            entry_price=entry_price,
+            account_balance=mt5_account_info.get('balance', 0),
+            current_positions=mt5_positions
+        )
+        
+        return can_trade, reason
 
 
-def calculate_liquidation_price_quick(entry_price: float,
-                                     quantity: float,
-                                     margin: float,
-                                     direction: str,
-                                     maintenance_margin: float = 0.005) -> float:
-    """Quick liquidation price calculation"""
-    if direction == 'long':
-        return entry_price - (margin / quantity)
-    else:
-        return entry_price + (margin / quantity)
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
 
-
-def calculate_max_position_size(balance: float,
-                               price: float,
-                               leverage: float,
-                               margin_rate: float = 0.01,
-                               margin_buffer: float = 0.1) -> float:
-    """Calculate maximum position size given margin constraints"""
-    available_margin = balance * leverage
-    notional = available_margin * (1 - margin_buffer)
-    return notional / price
+if __name__ == "__main__":
+    # Initialize calculator
+    config = {
+        'leverage': 30,
+        'margin_call_level': 100,
+        'stop_out_level': 50
+    }
+    
+    calc = MarginCalculator(config)
+    
+    # Set up symbol specs
+    calc.set_symbol_specs('EURUSD', SymbolSpecs(
+        symbol='EURUSD',
+        contract_size=100000,
+        point_size=0.0001,
+        digits=5
+    ))
+    
+    calc.set_symbol_specs('USDJPY', SymbolSpecs(
+        symbol='USDJPY',
+        contract_size=100000,
+        point_size=0.001,
+        digits=3
+    ))
+    
+    # Update prices
+    calc.update_price('EURUSD', 1.0850)
+    calc.update_price('USDJPY', 150.25)
+    
+    # Example: Calculate position size for $100 risk with 50 pip stop
+    print("Position Sizing Example:")
+    print("=" * 50)
+    
+    size_calc = calc.calculate_position_size('EURUSD', risk_amount=100, stop_loss_pips=50)
+    print(f"Risk Amount: ${size_calc['risk_amount']}")
+    print(f"Stop Loss: {size_calc['stop_loss_pips']} pips")
+    print(f"Position Size: {size_calc['position_size']:.3f} lots")
+    print(f"Units: {size_calc['units']:,.0f}")
+    print(f"Margin Required: ${size_calc['margin_required']:.2f}")
+    
+    # Example: Check account margin
+    print("\nAccount Margin Example:")
+    print("=" * 50)
+    
+    positions = [
+        {'symbol': 'EURUSD', 'quantity': 0.5, 'entry_price': 1.0800, 'direction': 'long'},
+        {'symbol': 'USDJPY', 'quantity': 0.3, 'entry_price': 149.50, 'direction': 'short'}
+    ]
+    
+    # Update current prices
+    calc.update_price('EURUSD', 1.0850)  # +50 pips for EURUSD long
+    calc.update_price('USDJPY', 150.25)  # -75 pips for USDJPY short
+    
+    account = calc.calculate_account_margin(balance=5000, positions=positions)
+    
+    print(f"Balance: ${account.balance:,.2f}")
+    print(f"Equity: ${account.equity:,.2f}")
+    print(f"Used Margin: ${account.used_margin:,.2f}")
+    print(f"Free Margin: ${account.free_margin:,.2f}")
+    print(f"Margin Level: {account.margin_level:.1f}%")
+    print(f"Status: {account.status.upper()}")
+    print(f"Total Unrealized PnL: ${account.total_unrealized_pnl:,.2f}")
+    
+    # Position details
+    print("\nPosition Details:")
+    for pos in account.positions:
+        print(f"\n{pos.symbol} {pos.direction.upper()}")
+        print(f"  Size: {pos.quantity} lots")
+        print(f"  Entry: {pos.entry_price}")
+        print(f"  Current: {pos.current_price}")
+        print(f"  Unrealized PnL: ${pos.unrealized_pnl:,.2f} ({pos.unrealized_pnl_pips:+.1f} pips)")
+        print(f"  Used Margin: ${pos.used_margin:,.2f}")
+        print(f"  Liquidation Price: {pos.liquidation_price}")
+        print(f"  Distance to Liquidation: {pos.distance_to_liquidation_pips:.0f} pips")
+    
+    # Check for trade
+    print("\nTrade Permission Check:")
+    print("=" * 50)
+    
+    can_trade, reason, details = calc.check_margin_for_trade(
+        symbol='EURUSD',
+        quantity=1.0,
+        direction='long',
+        entry_price=1.0850,
+        account_balance=5000,
+        current_positions=positions
+    )
+    
+    print(f"Can Trade: {'YES' if can_trade else 'NO'}")
+    print(f"Reason: {reason}")
+    if details:
+        for key, value in details.items():
+            print(f"  {key}: {value}")
+    
+    # Margin alerts
+    print("\nMargin Alerts:")
+    print("=" * 50)
+    alerts = calc.get_margin_alerts(account)
+    for alert in alerts:
+        print(f"[{alert['level'].upper()}] {alert['type']}: {alert['message']}")

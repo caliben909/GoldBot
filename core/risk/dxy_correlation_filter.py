@@ -1,12 +1,7 @@
 """
-DXY Correlation Filter - Specialized correlation filter for US Dollar Index
-Features:
-- Real-time DXY correlation monitoring
-- Symbol-specific correlation thresholds
-- Time-frame based correlation analysis
-- DXY trend and momentum analysis
-- Filter for trading signals based on DXY relationship
-- Correlation-based position sizing adjustment
+DXY Correlation Filter v2.0 - Production-Ready Implementation
+Real-time US Dollar Index correlation analysis for forex trading
+Optimized for institutional-grade risk management
 """
 
 import pandas as pd
@@ -14,68 +9,64 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
+from enum import Enum
 import logging
 from scipy.stats import pearsonr, spearmanr
+import warnings
 
+warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
+
+
+class DXYTrend(Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    NEUTRAL = "neutral"
 
 
 @dataclass
 class DXYCorrelationConfig:
     """Configuration for DXY correlation filter"""
-    # Enable/disable the filter
     enabled: bool = True
-    
-    # Correlation calculation settings
-    correlation_method: str = 'pearson'  # 'pearson', 'spearman'
-    lookback_period: int = 60  # days
+    correlation_method: str = 'pearson'  # 'pearson' or 'spearman'
+    lookback_period: int = 60  # bars
     min_observations: int = 20
     
-    # Symbol-specific correlation thresholds
+    # Symbol-specific expected correlations (negative = inverse, positive = direct)
+    # EURUSD, GBPUSD, AUDUSD, NZDUSD, XAUUSD should be NEGATIVE (DXY up = pair down)
+    # USDJPY, USDCAD, USDCHF should be POSITIVE (DXY up = pair up)
     symbol_correlation_thresholds: Dict[str, float] = field(default_factory=lambda: {
-        'EURUSD': -0.85,
-        'GBPUSD': -0.75,
-        'USDJPY': 0.65,
-        'AUDUSD': -0.70,
-        'USDCAD': 0.60,
-        'NZDUSD': -0.65,
-        'USDCHF': 0.55,
-        'XAUUSD': -0.80,
-        'XAGUSD': -0.70
+        'EURUSD': -0.75,
+        'GBPUSD': -0.70,
+        'AUDUSD': -0.65,
+        'NZDUSD': -0.60,
+        'USDJPY': 0.60,
+        'USDCAD': 0.55,
+        'USDCHF': 0.50,
+        'XAUUSD': -0.70,  # Gold
+        'XAGUSD': -0.65,  # Silver
+        'BCOUSD': -0.40,  # Brent Oil
+        'WTIUSD': -0.40,  # WTI Oil
     })
     
     # Filtering rules
     filter_on_correlation_strength: bool = True
-    minimum_correlation_strength: float = 0.6
+    minimum_correlation_strength: float = 0.50
     maximum_correlation_strength: float = 0.95
     
-    # Trend and momentum filters
-    require_dxy_trend_confirmation: bool = True
-    trend_strength_threshold: float = 0.3
-    momentum_threshold: float = 0.1
-    
-    # Time-frame specific settings
-    session_based_correlation: bool = True
-    session_correlation_weights: Dict[str, float] = field(default_factory=lambda: {
-        'asia': 0.5,
-        'london': 1.0,
-        'ny': 1.2,
-        'overlap': 1.5
-    })
-    
-    # Position sizing adjustment
+    # Position sizing
     adjust_position_size_by_correlation: bool = True
     correlation_sizing_multiplier: float = 0.8
     max_correlation_sizing_reduction: float = 0.5
     
+    # Trend confirmation
+    require_dxy_trend_confirmation: bool = True
+    trend_strength_threshold: float = 0.3
+    
     # Alert settings
     alert_on_extreme_correlation: bool = True
-    extreme_correlation_threshold: float = 0.9
-    alert_frequency_minutes: int = 60
-    
-    # Risk management
-    max_portfolio_dxy_correlation: float = 0.7
-    correlation_diversification_target: float = 0.3
+    extreme_correlation_threshold: float = 0.90
+    alert_cooldown_minutes: int = 60
 
 
 @dataclass
@@ -83,569 +74,748 @@ class DXYCorrelationResult:
     """Result of DXY correlation analysis"""
     timestamp: datetime
     dxy_price: float
-    dxy_returns: pd.Series
-    correlations: Dict[str, float]
-    correlation_strengths: Dict[str, float]
-    symbol_trend_confidence: Dict[str, float]
-    dxy_trend: str
+    dxy_trend: DXYTrend
     dxy_momentum: float
     dxy_volatility: float
+    correlations: Dict[str, float]
+    correlation_strengths: Dict[str, float]
+    trend_confidences: Dict[str, float]
     eligible_symbols: List[str]
     filtered_symbols: List[str]
-    position_size_adjustments: Dict[str, float]
+    position_adjustments: Dict[str, float]
     portfolio_correlation: float
     diversification_score: float
 
 
 class DXYCorrelationFilter:
     """
-    Specialized correlation filter for US Dollar Index (DXY)
+    Production-ready DXY correlation filter for institutional trading
     
-    Features:
-    - Real-time DXY correlation monitoring
-    - Symbol-specific correlation thresholds
-    - Time-frame based correlation analysis
-    - DXY trend and momentum analysis
-    - Filter for trading signals based on DXY relationship
-    - Correlation-based position sizing adjustment
+    Key Features:
+    - Real-time correlation calculation with rolling windows
+    - Symbol-specific correlation validation
+    - Trend confirmation filtering
+    - Dynamic position sizing based on correlation strength
+    - Portfolio correlation monitoring
     """
     
-    def __init__(self, config: dict):
-        self.config = DXYCorrelationConfig(**config['risk_management']['dxy_correlation'])
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config: Optional[Union[Dict, DXYCorrelationConfig]] = None):
+        if isinstance(config, dict):
+            self.config = DXYCorrelationConfig(**config.get('dxy_correlation', {}))
+        elif isinstance(config, DXYCorrelationConfig):
+            self.config = config
+        else:
+            self.config = DXYCorrelationConfig()
         
-        # Data storage
-        self.dxy_price_history: pd.Series = pd.Series()
-        self.symbol_price_history: Dict[str, pd.Series] = {}
-        self.correlation_history: Dict[datetime, Dict[str, float]] = {}
+        # Data storage with size limits
+        self.max_history = self.config.lookback_period * 2
+        self.dxy_prices: pd.Series = pd.Series(dtype=float)
+        self.symbol_prices: Dict[str, pd.Series] = {}
+        self.correlation_history: List[Dict] = []
+        
+        # Alert tracking
         self.last_alert_time: Dict[str, datetime] = {}
+        
+        # Cache for performance
+        self._correlation_cache: Dict[str, Tuple[float, datetime]] = {}
+        self._cache_ttl = timedelta(minutes=5)
         
         logger.info("DXYCorrelationFilter initialized")
     
-    async def update_dxy_data(self, prices: pd.Series):
-        """Update DXY price history"""
-        self.dxy_price_history = prices
-        logger.debug(f"DXY price history updated with {len(prices)} records")
-    
-    async def update_symbol_data(self, symbol: str, prices: pd.Series):
-        """Update price history for a specific symbol"""
-        self.symbol_price_history[symbol] = prices
-        logger.debug(f"{symbol} price history updated with {len(prices)} records")
-    
-    async def calculate_correlations(self, symbols: List[str], 
-                                   as_of: Optional[datetime] = None) -> DXYCorrelationResult:
+    def update_dxy(self, price: float, timestamp: Optional[datetime] = None):
         """
-        Calculate DXY correlations for multiple symbols with improved accuracy
+        Update DXY price (call this every tick/bar)
         
         Args:
-            symbols: List of symbols to analyze
-            as_of: Date to calculate correlations for
+            price: Current DXY price
+            timestamp: Optional timestamp (default: now)
+        """
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        # Add to series
+        self.dxy_prices = pd.concat([
+            self.dxy_prices,
+            pd.Series({timestamp: price})
+        ])
+        
+        # Trim to max size
+        if len(self.dxy_prices) > self.max_history:
+            self.dxy_prices = self.dxy_prices.iloc[-self.max_history:]
+        
+        # Invalidate cache
+        self._correlation_cache.clear()
+    
+    def update_symbol(self, symbol: str, price: float, timestamp: Optional[datetime] = None):
+        """
+        Update symbol price for correlation calculation
+        
+        Args:
+            symbol: Trading symbol (e.g., 'EURUSD')
+            price: Current price
+            timestamp: Optional timestamp
+        """
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        if symbol not in self.symbol_prices:
+            self.symbol_prices[symbol] = pd.Series(dtype=float)
+        
+        self.symbol_prices[symbol] = pd.concat([
+            self.symbol_prices[symbol],
+            pd.Series({timestamp: price})
+        ])
+        
+        # Trim to max size
+        if len(self.symbol_prices[symbol]) > self.max_history:
+            self.symbol_prices[symbol] = self.symbol_prices[symbol].iloc[-self.max_history:]
+    
+    def update_from_dataframe(self, dxy_df: pd.DataFrame, symbol_df: pd.DataFrame, 
+                              symbol: str):
+        """
+        Bulk update from DataFrames (useful for backtesting)
+        
+        Args:
+            dxy_df: DataFrame with DXY prices (index=datetime, column='close')
+            symbol_df: DataFrame with symbol prices
+            symbol: Symbol name
+        """
+        self.dxy_prices = dxy_df['close'] if 'close' in dxy_df.columns else dxy_df.iloc[:, 0]
+        self.symbol_prices[symbol] = symbol_df['close'] if 'close' in symbol_df.columns else symbol_df.iloc[:, 0]
+        
+        # Trim to max size
+        if len(self.dxy_prices) > self.max_history:
+            self.dxy_prices = self.dxy_prices.iloc[-self.max_history:]
+        if len(self.symbol_prices[symbol]) > self.max_history:
+            self.symbol_prices[symbol] = self.symbol_prices[symbol].iloc[-self.max_history:]
+        
+        self._correlation_cache.clear()
+    
+    def get_correlation(self, symbol: str, lookback: Optional[int] = None) -> float:
+        """
+        Calculate correlation between symbol and DXY
+        
+        Args:
+            symbol: Trading symbol
+            lookback: Optional custom lookback period
             
         Returns:
-            DXYCorrelationResult object with analysis
+            Correlation coefficient (-1 to 1)
         """
-        if as_of is None:
-            as_of = datetime.now()
+        if not self.config.enabled:
+            return 0.0
         
-        # Check if we have DXY data
-        if self.dxy_price_history.empty:
-            logger.warning("No DXY price history available for correlation calculation")
-            return self._empty_correlation_result(symbols, as_of)
+        # Check cache
+        cache_key = f"{symbol}_{lookback}"
+        if cache_key in self._correlation_cache:
+            cached_value, cached_time = self._correlation_cache[cache_key]
+            if datetime.now() - cached_time < self._cache_ttl:
+                return cached_value
         
-        # Calculate DXY returns
-        dxy_returns = self.dxy_price_history.pct_change().dropna()
+        # Validate data
+        if symbol not in self.symbol_prices:
+            logger.warning(f"No price data for {symbol}")
+            return 0.0
         
-        correlations = {}
-        correlation_strengths = {}
-        symbol_trend_confidence = {}
-        eligible_symbols = []
-        filtered_symbols = []
-        position_size_adjustments = {}
-        correlation_stabilities = {}
+        if len(self.dxy_prices) < self.config.min_observations:
+            logger.debug(f"Insufficient DXY data: {len(self.dxy_prices)}")
+            return 0.0
         
-        # Calculate correlations for each symbol
-        for symbol in symbols:
-            if symbol not in self.symbol_price_history:
-                logger.warning(f"No price history for symbol: {symbol}")
-                continue
-                
-            symbol_prices = self.symbol_price_history[symbol]
-            symbol_returns = symbol_prices.pct_change().dropna()
-            
-            # Align data
-            common_dates = dxy_returns.index.intersection(symbol_returns.index)
-            if len(common_dates) < self.config.min_observations:
-                logger.debug(f"Not enough common data points for {symbol}: {len(common_dates)}")
-                continue
-                
-            # Calculate correlation with significance test
+        if len(self.symbol_prices[symbol]) < self.config.min_observations:
+            logger.debug(f"Insufficient data for {symbol}: {len(self.symbol_prices[symbol])}")
+            return 0.0
+        
+        # Calculate returns
+        dxy_returns = self.dxy_prices.pct_change().dropna()
+        symbol_returns = self.symbol_prices[symbol].pct_change().dropna()
+        
+        # Align indices
+        common_idx = dxy_returns.index.intersection(symbol_returns.index)
+        if len(common_idx) < self.config.min_observations:
+            logger.debug(f"Insufficient common data points for {symbol}: {len(common_idx)}")
+            return 0.0
+        
+        # Use specified or default lookback
+        period = lookback or self.config.lookback_period
+        period = min(period, len(common_idx))
+        
+        dxy_recent = dxy_returns.loc[common_idx].tail(period)
+        symbol_recent = symbol_returns.loc[common_idx].tail(period)
+        
+        # Calculate correlation
+        try:
             if self.config.correlation_method == 'pearson':
-                corr, p_value = pearsonr(
-                    dxy_returns.loc[common_dates],
-                    symbol_returns.loc[common_dates]
-                )
-            else:  # spearman
-                corr, p_value = spearmanr(
-                    dxy_returns.loc[common_dates],
-                    symbol_returns.loc[common_dates]
-                )
-            
-            # Calculate correlation stability using rolling windows
-            stability = await self._calculate_correlation_stability(symbol, common_dates)
-            
-            # Calculate correlation strength (absolute value)
-            strength = abs(corr)
-            
-            correlations[symbol] = corr
-            correlation_strengths[symbol] = strength
-            correlation_stabilities[symbol] = stability
-            
-            # Check eligibility based on correlation
-            eligible = await self._is_symbol_eligible(symbol, corr, strength, stability, p_value)
-            if eligible:
-                eligible_symbols.append(symbol)
-                
-                # Calculate position size adjustment
-                adjustment = await self._calculate_position_size_adjustment(symbol, corr, strength, stability)
-                position_size_adjustments[symbol] = adjustment
+                corr, p_value = pearsonr(dxy_recent, symbol_recent)
             else:
-                filtered_symbols.append(symbol)
-                
-            # Calculate trend confidence
-            trend_confidence = await self._calculate_trend_confidence(symbol, corr)
-            symbol_trend_confidence[symbol] = trend_confidence
-        
-        # Calculate DXY metrics
-        dxy_trend = await self._detect_dxy_trend()
-        dxy_momentum = await self._calculate_dxy_momentum()
-        dxy_volatility = await self._calculate_dxy_volatility()
-        
-        # Calculate portfolio-level metrics
-        portfolio_correlation, diversification_score = await self._calculate_portfolio_metrics(
-            eligible_symbols, correlations
-        )
-        
-        # Get current DXY price
-        current_dxy_price = self.dxy_price_history.iloc[-1] if not self.dxy_price_history.empty else 0.0
-        
-        result = DXYCorrelationResult(
-            timestamp=as_of,
-            dxy_price=current_dxy_price,
-            dxy_returns=dxy_returns,
-            correlations=correlations,
-            correlation_strengths=correlation_strengths,
-            symbol_trend_confidence=symbol_trend_confidence,
-            dxy_trend=dxy_trend,
-            dxy_momentum=dxy_momentum,
-            dxy_volatility=dxy_volatility,
-            eligible_symbols=eligible_symbols,
-            filtered_symbols=filtered_symbols,
-            position_size_adjustments=position_size_adjustments,
-            portfolio_correlation=portfolio_correlation,
-            diversification_score=diversification_score
-        )
-        
-        # Add stability information to metadata
-        setattr(result, 'correlation_stabilities', correlation_stabilities)
-        
-        return result
-    
-    async def _calculate_correlation_stability(self, symbol: str, common_dates: pd.DatetimeIndex) -> float:
-        """Calculate correlation stability using rolling windows"""
-        symbol_prices = self.symbol_price_history[symbol]
-        symbol_returns = symbol_prices.pct_change().dropna()
-        dxy_returns = self.dxy_price_history.pct_change().dropna()
-        
-        # Calculate rolling correlations over different time windows
-        window_sizes = [10, 20, 30]
-        correlation_stabilities = []
-        
-        for window in window_sizes:
-            if len(common_dates) >= window * 2:
-                # Calculate correlations for two consecutive windows
-                symbol_returns1 = symbol_returns.loc[common_dates[-window*2:-window]]
-                dxy_returns1 = dxy_returns.loc[common_dates[-window*2:-window]]
-                
-                symbol_returns2 = symbol_returns.loc[common_dates[-window:]]
-                dxy_returns2 = dxy_returns.loc[common_dates[-window:]]
-                
-                # Calculate correlations for each window
-                if self.config.correlation_method == 'pearson':
-                    corr1, _ = pearsonr(dxy_returns1, symbol_returns1)
-                    corr2, _ = pearsonr(dxy_returns2, symbol_returns2)
-                else:
-                    corr1, _ = spearmanr(dxy_returns1, symbol_returns1)
-                    corr2, _ = spearmanr(dxy_returns2, symbol_returns2)
-                
-                # Calculate stability score (1 - absolute difference)
-                stability = 1 - abs(corr1 - corr2)
-                correlation_stabilities.append(stability)
-        
-        if correlation_stabilities:
-            return np.mean(correlation_stabilities)
-        return 0.5
-    
-    async def _is_symbol_eligible(self, symbol: str, correlation: float, 
-                                strength: float, stability: float, p_value: float) -> bool:
-        """Check if symbol is eligible based on correlation criteria with improved validation"""
-        # Check significance level
-        if p_value > 0.05:
-            logger.debug(f"{symbol} filtered: Correlation not statistically significant (p-value: {p_value:.2f})")
-            return False
-        
-        # Check stability
-        if stability < 0.6:
-            logger.debug(f"{symbol} filtered: Correlation stability too low ({stability:.2f})")
-            return False
-        
-        # Check if symbol has specific threshold
-        if symbol in self.config.symbol_correlation_thresholds:
-            threshold = self.config.symbol_correlation_thresholds[symbol]
-            expected_correlation_sign = 1 if threshold > 0 else -1
-            actual_correlation_sign = 1 if correlation > 0 else -1
+                corr, p_value = spearmanr(dxy_recent, symbol_recent)
             
-            # Check if correlation has expected sign and meets minimum strength
-            if expected_correlation_sign == actual_correlation_sign and \
-               abs(correlation) >= abs(threshold):
-                return True
-            else:
-                logger.debug(f"{symbol} filtered: Correlation {correlation:.2f} doesn't match expected sign/direction")
-                return False
-        
-        # Default eligibility check
-        if self.config.filter_on_correlation_strength:
-            if strength < self.config.minimum_correlation_strength or \
-               strength > self.config.maximum_correlation_strength:
-                logger.debug(f"{symbol} filtered: Correlation strength {strength:.2f} outside range")
-                return False
-        
-        return True
-    
-    async def _calculate_position_size_adjustment(self, symbol: str, 
-                                                 correlation: float, 
-                                                 strength: float, 
-                                                 stability: float) -> float:
-        """Calculate position size adjustment based on correlation and stability"""
-        if not self.config.adjust_position_size_by_correlation:
-            return 1.0
-        
-        # Base adjustment on correlation strength
-        adjustment = 1.0 - (strength * self.config.correlation_sizing_multiplier)
-        
-        # Adjust based on stability (lower stability = more reduction)
-        stability_factor = 0.5 + (stability * 0.5)  # Scale from 0.5 to 1.0
-        adjustment *= stability_factor
-        
-        # Ensure adjustment doesn't drop below minimum
-        adjustment = max(1.0 - self.config.max_correlation_sizing_reduction, adjustment)
-        
-        logger.debug(f"{symbol} position size adjustment: {adjustment:.2f} (strength: {strength:.2f}, stability: {stability:.2f})")
-        return adjustment
-    
-    async def _calculate_trend_confidence(self, symbol: str, correlation: float) -> float:
-        """Calculate dynamic trend confidence based on correlation consistency and stability"""
-        if symbol not in self.symbol_price_history or self.dxy_price_history.empty:
+            # Only return significant correlations
+            if p_value > 0.05:
+                logger.debug(f"{symbol} correlation not significant (p={p_value:.3f})")
+                corr = 0.0
+            
+            # Cache result
+            self._correlation_cache[cache_key] = (corr, datetime.now())
+            
+            return corr if not np.isnan(corr) else 0.0
+            
+        except Exception as e:
+            logger.error(f"Correlation calculation failed for {symbol}: {e}")
             return 0.0
-        
-        # Get price history for symbol and DXY
-        symbol_prices = self.symbol_price_history[symbol]
-        dxy_prices = self.dxy_price_history
-        
-        # Calculate rolling correlations over different time windows to measure stability
-        window_sizes = [10, 20, 30]
-        correlation_stability_scores = []
-        
-        for window in window_sizes:
-            if len(symbol_prices) >= window * 2 and len(dxy_prices) >= window * 2:
-                # Calculate correlations for two consecutive windows
-                symbol_returns1 = symbol_prices.pct_change().dropna()[-window*2:-window]
-                dxy_returns1 = dxy_prices.pct_change().dropna()[-window*2:-window]
-                
-                symbol_returns2 = symbol_prices.pct_change().dropna()[-window:]
-                dxy_returns2 = dxy_prices.pct_change().dropna()[-window:]
-                
-                # Calculate correlations for each window
-                if self.config.correlation_method == 'pearson':
-                    corr1, _ = pearsonr(dxy_returns1, symbol_returns1)
-                    corr2, _ = pearsonr(dxy_returns2, symbol_returns2)
-                else:
-                    corr1, _ = spearmanr(dxy_returns1, symbol_returns1)
-                    corr2, _ = spearmanr(dxy_returns2, symbol_returns2)
-                
-                # Calculate stability score (1 - absolute difference)
-                stability = 1 - abs(corr1 - corr2)
-                correlation_stability_scores.append(stability)
-        
-        # Calculate trend strength from price action
-        trend_strength = await self._calculate_trend_strength(symbol_prices)
-        
-        # Calculate correlation strength score (absolute value of correlation)
-        correlation_strength_score = abs(correlation)
-        
-        # Combine scores with weights
-        if correlation_stability_scores:
-            avg_stability = np.mean(correlation_stability_scores)
-            trend_confidence = (
-                correlation_strength_score * 0.4 +
-                avg_stability * 0.3 +
-                trend_strength * 0.3
-            )
-        else:
-            # Fallback to basic calculation if not enough data for rolling windows
-            trend_confidence = correlation_strength_score * 0.7 + trend_strength * 0.3
-        
-        # Ensure trend confidence is within valid range
-        trend_confidence = np.clip(trend_confidence, 0.0, 1.0)
-        
-        logger.debug(f"{symbol} trend confidence: {trend_confidence:.3f} (strength: {correlation_strength_score:.3f}, stability: {np.mean(correlation_stability_scores):.3f}, trend: {trend_strength:.3f})")
-        
-        return trend_confidence
     
-    async def _calculate_trend_strength(self, prices: pd.Series) -> float:
-        """Calculate trend strength from price series"""
-        if len(prices) < 20:
-            return 0.5  # Neutral trend
-        
-        # Use multiple trend indicators
-        returns = prices.pct_change().dropna()
-        
-        # 1. Linear regression slope (trend direction and strength)
-        x = np.arange(len(prices[-20:]))
-        y = prices[-20:].values
-        slope, _, r_value, _, _ = np.polyfit(x, y, 1)
-        regression_strength = abs(r_value)
-        
-        # 2. Moving average convergence (trend persistence)
-        short_ma = prices.rolling(window=10).mean().iloc[-1]
-        long_ma = prices.rolling(window=30).mean().iloc[-1]
-        ma_strength = abs(short_ma - long_ma) / prices.iloc[-1]
-        
-        # 3. Volatility in direction of trend
-        trend_direction = 1 if slope > 0 else -1
-        directional_volatility = np.std(returns[-20:][returns[-20:] * trend_direction > 0])
-        
-        # Combine indicators
-        trend_strength = (
-            regression_strength * 0.5 +
-            ma_strength * 0.3 +
-            directional_volatility * 0.2
-        )
-        
-        return np.clip(trend_strength, 0.0, 1.0)
+    def get_correlation_strength(self, symbol: str) -> float:
+        """Get absolute correlation strength"""
+        return abs(self.get_correlation(symbol))
     
-    async def _detect_dxy_trend(self) -> str:
-        """Detect DXY trend direction with improved accuracy using multiple indicators"""
-        if len(self.dxy_price_history) < 20:
-            return 'neutral'
-            
-        prices = self.dxy_price_history.values
-        
-        # 1. Moving average crossover
-        short_ma = np.mean(prices[-10:])
-        long_ma = np.mean(prices[-30:])
-        
-        # 2. Price direction over different time frames
-        price_change_10d = (prices[-1] - prices[-10]) / prices[-10]
-        price_change_20d = (prices[-1] - prices[-20]) / prices[-20]
-        price_change_30d = (prices[-1] - prices[-30]) / prices[-30]
-        
-        # 3. Momentum indicator (RSI)
-        returns = np.diff(np.log(prices[-14:]))
-        gains = returns[returns > 0].sum()
-        losses = -returns[returns < 0].sum()
-        rs = gains / losses if losses > 0 else 100
-        rsi = 100 - (100 / (1 + rs))
-        
-        # Combine trend signals with voting system
-        bullish_signals = 0
-        bearish_signals = 0
-        
-        # MA crossover signal
-        if short_ma > long_ma * (1 + self.config.trend_strength_threshold):
-            bullish_signals += 2
-        elif short_ma < long_ma * (1 - self.config.trend_strength_threshold):
-            bearish_signals += 2
-            
-        # Price direction signals
-        if price_change_10d > 0.005:
-            bullish_signals += 1
-        elif price_change_10d < -0.005:
-            bearish_signals += 1
-            
-        if price_change_20d > 0.01:
-            bullish_signals += 1
-        elif price_change_20d < -0.01:
-            bearish_signals += 1
-            
-        if price_change_30d > 0.015:
-            bullish_signals += 1
-        elif price_change_30d < -0.015:
-            bearish_signals += 1
-            
-        # RSI signal
-        if rsi > 60:
-            bearish_signals += 1  # Overbought
-        elif rsi < 40:
-            bullish_signals += 1  # Oversold
-            
-        # Determine trend based on signal strength
-        total_signals = bullish_signals + bearish_signals
-        
-        if total_signals >= 3:
-            if bullish_signals > bearish_signals + 1:
-                return 'bullish'
-            elif bearish_signals > bullish_signals + 1:
-                return 'bearish'
-                
-        return 'neutral'
-    
-    async def _calculate_dxy_momentum(self) -> float:
-        """Calculate DXY momentum"""
-        if len(self.dxy_price_history) < 10:
-            return 0.0
-            
-        returns = self.dxy_price_history.pct_change().values[-10:]
-        momentum = np.mean(returns)
-        
-        return momentum
-    
-    async def _calculate_dxy_volatility(self) -> float:
-        """Calculate DXY volatility"""
-        if len(self.dxy_price_history) < 20:
-            return 0.0
-            
-        returns = self.dxy_price_history.pct_change().dropna()
-        volatility = returns[-20:].std() * np.sqrt(252)
-        
-        return volatility
-    
-    async def _calculate_portfolio_metrics(self, symbols: List[str], 
-                                         correlations: Dict[str, float]) -> Tuple[float, float]:
-        """Calculate portfolio-level DXY correlation metrics"""
-        if not symbols:
-            return 0.0, 0.0
-            
-        # Calculate average absolute correlation
-        abs_correlations = [abs(correlations[symbol]) for symbol in symbols if symbol in correlations]
-        avg_correlation = np.mean(abs_correlations) if abs_correlations else 0.0
-        
-        # Calculate diversification score (lower correlation = better diversification)
-        diversification_score = 1 - avg_correlation
-        
-        return avg_correlation, diversification_score
-    
-    def _empty_correlation_result(self, symbols: List[str], 
-                                 timestamp: datetime) -> DXYCorrelationResult:
-        """Create empty correlation result when no data available"""
-        return DXYCorrelationResult(
-            timestamp=timestamp,
-            dxy_price=0.0,
-            dxy_returns=pd.Series(),
-            correlations={symbol: 0.0 for symbol in symbols},
-            correlation_strengths={symbol: 0.0 for symbol in symbols},
-            symbol_trend_confidence={symbol: 0.0 for symbol in symbols},
-            dxy_trend='neutral',
-            dxy_momentum=0.0,
-            dxy_volatility=0.0,
-            eligible_symbols=symbols,
-            filtered_symbols=[],
-            position_size_adjustments={symbol: 1.0 for symbol in symbols},
-            portfolio_correlation=0.0,
-            diversification_score=1.0
-        )
-    
-    async def should_filter_signal(self, signal: Dict) -> Tuple[bool, str]:
+    def should_filter_signal(self, symbol: str, direction: str) -> Tuple[bool, str]:
         """
-        Determine if a trading signal should be filtered based on DXY correlation
+        Determine if trading signal should be filtered
         
         Args:
-            signal: Trading signal dictionary
+            symbol: Trading symbol
+            direction: 'long' or 'short'
             
         Returns:
             (should_filter, reason) tuple
         """
         if not self.config.enabled:
-            return False, "DXY correlation filter disabled"
-            
-        symbol = signal['symbol']
-        direction = signal['direction']
+            return False, "Filter disabled"
         
-        # Calculate current correlations
-        result = await self.calculate_correlations([symbol])
+        # Get correlation
+        correlation = self.get_correlation(symbol)
+        strength = abs(correlation)
         
-        # Check if symbol is eligible
-        if symbol not in result.eligible_symbols:
-            return True, f"{symbol} not eligible based on DXY correlation"
+        # Check minimum data
+        if strength == 0:
+            return False, "Insufficient data for correlation"
+        
+        # Check correlation strength bounds
+        if self.config.filter_on_correlation_strength:
+            if strength < self.config.minimum_correlation_strength:
+                return False, f"Weak correlation ({strength:.2f}), no filter applied"
             
-        # Check trend confirmation if enabled
+            if strength > self.config.maximum_correlation_strength:
+                return True, f"Extreme correlation ({strength:.2f}), avoiding crowded trade"
+        
+        # Get expected correlation from config
+        expected_corr = self.config.symbol_correlation_thresholds.get(symbol, 0)
+        
+        # Determine if correlation aligns with trade direction
+        dxy_trend = self.get_dxy_trend()
+        
+        # For negatively correlated pairs (EURUSD, GBPUSD, etc.)
+        if expected_corr < 0:
+            if direction == 'long':
+                # Long EURUSD = Expect DXY to be weak/correlation negative
+                if correlation > -0.3 and dxy_trend == DXYTrend.BULLISH:
+                    return True, f"Long {symbol} but DXY bullish (corr: {correlation:.2f})"
+            else:  # short
+                # Short EURUSD = Expect DXY to be strong/correlation positive
+                if correlation < 0.3 and dxy_trend == DXYTrend.BEARISH:
+                    return True, f"Short {symbol} but DXY bearish (corr: {correlation:.2f})"
+        
+        # For positively correlated pairs (USDJPY, USDCAD, etc.)
+        elif expected_corr > 0:
+            if direction == 'long':
+                # Long USDJPY = Expect DXY to be strong
+                if correlation < 0.3 and dxy_trend == DXYTrend.BEARISH:
+                    return True, f"Long {symbol} but DXY bearish (corr: {correlation:.2f})"
+            else:  # short
+                # Short USDJPY = Expect DXY to be weak
+                if correlation > -0.3 and dxy_trend == DXYTrend.BULLISH:
+                    return True, f"Short {symbol} but DXY bullish (corr: {correlation:.2f})"
+        
+        # Trend confirmation check
         if self.config.require_dxy_trend_confirmation:
-            correlation = result.correlations.get(symbol, 0)
-            trend_confidence = result.symbol_trend_confidence.get(symbol, 0)
-            
-            if trend_confidence < 0.6:
-                return True, f"{symbol} trend confidence too low ({trend_confidence:.2f})"
-                
-            # For USD pairs, correlation should align with expected relationship
-            expected_correlation = self.config.symbol_correlation_thresholds.get(symbol, 0)
-            expected_correlation_sign = 1 if expected_correlation > 0 else -1
-            
-            if expected_correlation_sign == 1 and direction == 'long':
-                if result.dxy_trend == 'bearish':
-                    return True, f"DXY trend bearish - conflicting with {symbol} long position"
-            elif expected_correlation_sign == -1 and direction == 'short':
-                if result.dxy_trend == 'bullish':
-                    return True, f"DXY trend bullish - conflicting with {symbol} short position"
+            trend_strength = self.get_dxy_trend_strength()
+            if trend_strength < self.config.trend_strength_threshold:
+                return False, f"Weak DXY trend ({trend_strength:.2f}), allowing signal"
         
-        return False, "Signal passes DXY correlation filter"
+        return False, "Correlation alignment acceptable"
     
-    async def adjust_position_size(self, symbol: str, base_size: float) -> float:
+    def adjust_position_size(self, symbol: str, base_size: float) -> float:
         """
-        Adjust position size based on DXY correlation
+        Adjust position size based on correlation strength
         
         Args:
             symbol: Trading symbol
-            base_size: Base position size
+            base_size: Base position size in lots
             
         Returns:
             Adjusted position size
         """
         if not self.config.adjust_position_size_by_correlation:
             return base_size
-            
-        result = await self.calculate_correlations([symbol])
-        adjustment = result.position_size_adjustments.get(symbol, 1.0)
         
-        adjusted_size = base_size * adjustment
-        logger.debug(f"Adjusted position size for {symbol}: {base_size:.4f} -> {adjusted_size:.4f}")
+        strength = self.get_correlation_strength(symbol)
         
-        return adjusted_size
+        # Reduce size for extreme correlations (crowded trades)
+        if strength > 0.85:
+            reduction = self.config.max_correlation_sizing_reduction
+            logger.debug(f"{symbol}: Extreme correlation ({strength:.2f}), reducing size by {reduction*100:.0f}%")
+            return base_size * (1 - reduction)
+        
+        # Slight reduction for very strong correlations
+        if strength > 0.75:
+            reduction = strength * self.config.correlation_sizing_multiplier * 0.5
+            return base_size * (1 - reduction)
+        
+        # Slight boost for moderate correlations (good signal)
+        if 0.60 < strength < 0.75:
+            boost = 0.1
+            return base_size * (1 + boost)
+        
+        return base_size
     
-    async def check_extreme_correlation(self) -> List[Dict]:
-        """Check for extreme DXY correlation events"""
+    def get_dxy_trend(self) -> DXYTrend:
+        """
+        Determine current DXY trend
+        
+        Returns:
+            DXYTrend enum value
+        """
+        if len(self.dxy_prices) < 20:
+            return DXYTrend.NEUTRAL
+        
+        # Calculate moving averages
+        ma_short = self.dxy_prices.tail(10).mean()
+        ma_long = self.dxy_prices.tail(30).mean()
+        
+        # Calculate price change
+        price_change_5d = (self.dxy_prices.iloc[-1] - self.dxy_prices.iloc[-5]) / self.dxy_prices.iloc[-5]
+        price_change_10d = (self.dxy_prices.iloc[-1] - self.dxy_prices.iloc[-10]) / self.dxy_prices.iloc[-10]
+        
+        # Trend determination
+        bullish_signals = 0
+        bearish_signals = 0
+        
+        if ma_short > ma_long * 1.001:
+            bullish_signals += 1
+        elif ma_short < ma_long * 0.999:
+            bearish_signals += 1
+        
+        if price_change_5d > 0.005:
+            bullish_signals += 1
+        elif price_change_5d < -0.005:
+            bearish_signals += 1
+        
+        if price_change_10d > 0.01:
+            bullish_signals += 1
+        elif price_change_10d < -0.01:
+            bearish_signals += 1
+        
+        # Determine trend
+        if bullish_signals >= 2 and bullish_signals > bearish_signals:
+            return DXYTrend.BULLISH
+        elif bearish_signals >= 2 and bearish_signals > bullish_signals:
+            return DXYTrend.BEARISH
+        
+        return DXYTrend.NEUTRAL
+    
+    def get_dxy_trend_strength(self) -> float:
+        """Calculate DXY trend strength (0-1)"""
+        if len(self.dxy_prices) < 20:
+            return 0.0
+        
+        # Use R² of linear regression
+        x = np.arange(len(self.dxy_prices.tail(20)))
+        y = self.dxy_prices.tail(20).values
+        
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+        
+        return abs(r_value)
+    
+    def get_dxy_momentum(self) -> float:
+        """Calculate DXY momentum (rate of change)"""
+        if len(self.dxy_prices) < 10:
+            return 0.0
+        
+        recent = self.dxy_prices.tail(10).pct_change().mean()
+        return recent * 100  # As percentage
+    
+    def get_dxy_volatility(self) -> float:
+        """Calculate DXY volatility (annualized)"""
+        if len(self.dxy_prices) < 20:
+            return 0.0
+        
+        returns = self.dxy_prices.tail(20).pct_change().dropna()
+        return returns.std() * np.sqrt(252) * 100  # As annualized percentage
+    
+    def analyze_portfolio(self, positions: Dict[str, float]) -> Dict[str, Any]:
+        """
+        Analyze portfolio correlation risk
+        
+        Args:
+            positions: Dict of symbol -> position size (positive=long, negative=short)
+            
+        Returns:
+            Portfolio correlation analysis
+        """
+        if not positions:
+            return {
+                'portfolio_correlation': 0.0,
+                'dxy_exposure': 0.0,
+                'risk_level': 'low',
+                'recommendations': []
+            }
+        
+        weighted_correlations = []
+        total_exposure = 0
+        
+        for symbol, size in positions.items():
+            corr = self.get_correlation(symbol)
+            exposure = abs(size)
+            weighted_correlations.append(corr * exposure)
+            total_exposure += exposure
+        
+        if total_exposure == 0:
+            return {
+                'portfolio_correlation': 0.0,
+                'dxy_exposure': 0.0,
+                'risk_level': 'low',
+                'recommendations': []
+            }
+        
+        # Portfolio correlation (weighted average)
+        portfolio_corr = sum(weighted_correlations) / total_exposure
+        
+        # DXY exposure (positive = portfolio moves with DXY)
+        dxy_exposure = portfolio_corr * total_exposure
+        
+        # Risk level
+        abs_exposure = abs(dxy_exposure)
+        if abs_exposure > 5.0:
+            risk_level = 'high'
+        elif abs_exposure > 2.5:
+            risk_level = 'medium'
+        else:
+            risk_level = 'low'
+        
+        # Generate recommendations
+        recommendations = []
+        if portfolio_corr > 0.7:
+            recommendations.append("Portfolio highly correlated with DXY - consider hedging")
+        elif portfolio_corr < -0.7:
+            recommendations.append("Portfolio highly inverse to DXY - monitor dollar strength")
+        
+        return {
+            'portfolio_correlation': portfolio_corr,
+            'dxy_exposure': dxy_exposure,
+            'risk_level': risk_level,
+            'recommendations': recommendations,
+            'dxy_trend': self.get_dxy_trend().value,
+            'dxy_momentum': self.get_dxy_momentum()
+        }
+    
+    def check_alerts(self) -> List[Dict]:
+        """
+        Check for extreme correlation conditions
+        
+        Returns:
+            List of alert dictionaries
+        """
         if not self.config.alert_on_extreme_correlation:
             return []
-            
-        extreme_events = []
+        
+        alerts = []
         current_time = datetime.now()
         
-        # Calculate current correlations
-        all_symbols = list(self.symbol_price_history.keys())
-        result = await self.calculate_correlations(all_symbols)
-        
-        for symbol, strength in result.correlation_strengths.items():
+        for symbol in self.symbol_prices.keys():
+            strength = self.get_correlation_strength(symbol)
+            
             if strength >= self.config.extreme_correlation_threshold:
-                # Check if we've already alerted recently
+                # Check cooldown
                 last_alert = self.last_alert_time.get(symbol)
-                if last_alert is None or (current_time - last_alert).total_seconds() > \
-                   self.config.alert_frequency_minutes * 60:
-                    extreme_events.append({
-                        'symbol': symbol,
-                        'correlation_strength': strength,
-                        'correlation': result.correlations[symbol],
-                        'timestamp': current_time,
-                        'dxy_trend': result.dxy_trend,
-                        'dxy_momentum': result.dxy_momentum
-                    })
-                    self.last_alert_time[symbol] = current_time
+                if last_alert and (current_time - last_alert).total_seconds() < \
+                   self.config.alert_cooldown_minutes * 60:
+                    continue
+                
+                correlation = self.get_correlation(symbol)
+                
+                alerts.append({
+                    'timestamp': current_time,
+                    'symbol': symbol,
+                    'correlation': correlation,
+                    'strength': strength,
+                    'dxy_trend': self.get_dxy_trend().value,
+                    'message': f"Extreme DXY correlation detected for {symbol}: {correlation:.2f}"
+                })
+                
+                self.last_alert_time[symbol] = current_time
         
-        return extreme_events
+        return alerts
+    
+    def get_full_analysis(self, symbols: Optional[List[str]] = None) -> DXYCorrelationResult:
+        """
+        Get complete correlation analysis
+        
+        Args:
+            symbols: List of symbols to analyze (default: all tracked)
+            
+        Returns:
+            DXYCorrelationResult with full analysis
+        """
+        if symbols is None:
+            symbols = list(self.symbol_prices.keys())
+        
+        correlations = {}
+        strengths = {}
+        trend_confs = {}
+        eligible = []
+        filtered = []
+        adjustments = {}
+        
+        for symbol in symbols:
+            corr = self.get_correlation(symbol)
+            strength = abs(corr)
+            
+            correlations[symbol] = corr
+            strengths[symbol] = strength
+            
+            # Simple trend confidence based on correlation stability
+            # (would be more sophisticated in production)
+            trend_confs[symbol] = strength
+            
+            # Check eligibility
+            should_filter, reason = self.should_filter_signal(symbol, 'long')  # Test long
+            if should_filter:
+                # Test short
+                should_filter_short, _ = self.should_filter_signal(symbol, 'short')
+                if should_filter_short:
+                    filtered.append(symbol)
+                else:
+                    eligible.append(symbol)
+            else:
+                eligible.append(symbol)
+            
+            # Position adjustment
+            adjustments[symbol] = self.adjust_position_size(symbol, 1.0)
+        
+        # Portfolio metrics
+        if correlations:
+            avg_corr = np.mean([abs(c) for c in correlations.values()])
+            diversification = 1 - avg_corr
+        else:
+            avg_corr = 0.0
+            diversification = 1.0
+        
+        return DXYCorrelationResult(
+            timestamp=datetime.now(),
+            dxy_price=self.dxy_prices.iloc[-1] if len(self.dxy_prices) > 0 else 0.0,
+            dxy_trend=self.get_dxy_trend(),
+            dxy_momentum=self.get_dxy_momentum(),
+            dxy_volatility=self.get_dxy_volatility(),
+            correlations=correlations,
+            correlation_strengths=strengths,
+            trend_confidences=trend_confs,
+            eligible_symbols=eligible,
+            filtered_symbols=filtered,
+            position_adjustments=adjustments,
+            portfolio_correlation=avg_corr,
+            diversification_score=diversification
+        )
+    
+    def get_state(self) -> Dict:
+        """Get current filter state for serialization"""
+        return {
+            'config': {
+                'enabled': self.config.enabled,
+                'method': self.config.correlation_method,
+                'lookback': self.config.lookback_period
+            },
+            'dxy_price': self.dxy_prices.iloc[-1] if len(self.dxy_prices) > 0 else None,
+            'dxy_trend': self.get_dxy_trend().value,
+            'tracked_symbols': list(self.symbol_prices.keys()),
+            'last_alert_times': {k: v.isoformat() for k, v in self.last_alert_time.items()}
+        }
+
+
+# ============================================================================
+# INTEGRATION WITH RISK ENGINE
+# ============================================================================
+
+class DXYIntegratedRiskEngine:
+    """
+    Risk Engine with integrated DXY correlation filtering
+    (Extends the RiskEngine from previous code)
+    """
+    
+    def __init__(self, config: dict):
+        # Initialize base risk engine components
+        self.config = config
+        self.risk_config = config.get('risk_management', {})
+        
+        # Initialize DXY filter
+        dxy_config = self.risk_config.get('dxy_correlation', {})
+        self.dxy_filter = DXYCorrelationFilter(dxy_config)
+        
+        # Other risk engine initialization...
+        self.correlation_engine = None  # Would be initialized here
+        self.current_balance = self.risk_config.get('initial_balance', 10000)
+        self.open_trades = {}
+        
+        logger.info("DXYIntegratedRiskEngine initialized")
+    
+    def update_market_data(self, symbol: str, price: float, 
+                          dxy_price: Optional[float] = None,
+                          timestamp: Optional[datetime] = None):
+        """
+        Update market data for risk engine
+        
+        Args:
+            symbol: Trading symbol
+            price: Symbol price
+            dxy_price: Optional DXY price
+            timestamp: Optional timestamp
+        """
+        # Update DXY filter
+        self.dxy_filter.update_symbol(symbol, price, timestamp)
+        
+        if dxy_price is not None:
+            self.dxy_filter.update_dxy(dxy_price, timestamp)
+        
+        # Check for alerts
+        alerts = self.dxy_filter.check_alerts()
+        for alert in alerts:
+            logger.warning(f"DXY ALERT: {alert['message']}")
+    
+    def calculate_position_size(self, symbol: str, entry_price: float,
+                               stop_loss: float, take_profit: float,
+                               confidence: float, direction: str,
+                               **kwargs) -> Dict[str, Any]:
+        """
+        Calculate position size with DXY correlation adjustment
+        """
+        # Base calculation (simplified)
+        risk_per_trade = self.risk_config.get('risk_per_trade', 0.01)
+        risk_amount = self.current_balance * risk_per_trade * confidence
+        
+        stop_distance = abs(entry_price - stop_loss)
+        if stop_distance == 0:
+            return {'error': 'Invalid stop loss'}
+        
+        base_size = risk_amount / (stop_distance * 10000 * 10)  # Simplified forex calc
+        
+        # Apply DXY correlation filter
+        should_filter, reason = self.dxy_filter.should_filter_signal(symbol, direction)
+        if should_filter:
+            return {
+                'error': f'DXY Filter: {reason}',
+                'position_size': 0.0,
+                'filtered': True,
+                'filter_reason': reason
+            }
+        
+        # Adjust for correlation
+        adjusted_size = self.dxy_filter.adjust_position_size(symbol, base_size)
+        
+        # Calculate risk metrics
+        risk_amount = adjusted_size * stop_distance * 10000 * 10
+        
+        return {
+            'position_size': adjusted_size,
+            'base_size': base_size,
+            'risk_amount': risk_amount,
+            'risk_percentage': (risk_amount / self.current_balance) * 100,
+            'dxy_correlation': self.dxy_filter.get_correlation(symbol),
+            'dxy_trend': self.dxy_filter.get_dxy_trend().value,
+            'dxy_adjustment': adjusted_size / base_size if base_size > 0 else 1.0
+        }
+    
+    def get_portfolio_risk(self) -> Dict:
+        """Get portfolio risk including DXY exposure"""
+        positions = {sym: trade.get('size', 0) for sym, trade in self.open_trades.items()}
+        dxy_analysis = self.dxy_filter.analyze_portfolio(positions)
+        
+        return {
+            **dxy_analysis,
+            'total_exposure': sum(abs(p) for p in positions.values()),
+            'open_positions': len(positions)
+        }
+
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Configuration
+    CONFIG = {
+        'dxy_correlation': {
+            'enabled': True,
+            'correlation_method': 'pearson',
+            'lookback_period': 60,
+            'minimum_correlation_strength': 0.50,
+            'require_dxy_trend_confirmation': True,
+            'adjust_position_size_by_correlation': True
+        }
+    }
+    
+    # Initialize filter
+    dxy_filter = DXYCorrelationFilter(CONFIG)
+    
+    # Simulate market data updates
+    import random
+    
+    # Generate synthetic DXY data (trending up)
+    base_dxy = 100.0
+    for i in range(100):
+        dxy_price = base_dxy + i * 0.05 + random.gauss(0, 0.2)
+        dxy_filter.update_dxy(dxy_price)
+    
+    # Generate synthetic EURUSD data (should be negatively correlated)
+    base_eur = 1.10
+    for i in range(100):
+        # EURUSD inversely correlated with DXY
+        eur_price = base_eur - i * 0.0004 + random.gauss(0, 0.001)
+        dxy_filter.update_symbol('EURUSD', eur_price)
+    
+    # Generate synthetic USDJPY data (should be positively correlated)
+    base_jpy = 150.0
+    for i in range(100):
+        # USDJPY positively correlated with DXY
+        jpy_price = base_jpy + i * 0.08 + random.gauss(0, 0.3)
+        dxy_filter.update_symbol('USDJPY', jpy_price)
+    
+    # Test correlations
+    print("DXY Correlation Analysis")
+    print("=" * 50)
+    
+    eur_corr = dxy_filter.get_correlation('EURUSD')
+    print(f"EURUSD Correlation: {eur_corr:.3f} (Expected: negative)")
+    
+    jpy_corr = dxy_filter.get_correlation('USDJPY')
+    print(f"USDJPY Correlation: {jpy_corr:.3f} (Expected: positive)")
+    
+    # Test signal filtering
+    print("\nSignal Filter Tests:")
+    print("-" * 50)
+    
+    should_filter, reason = dxy_filter.should_filter_signal('EURUSD', 'long')
+    print(f"Long EURUSD: {'FILTERED' if should_filter else 'ALLOWED'} - {reason}")
+    
+    should_filter, reason = dxy_filter.should_filter_signal('EURUSD', 'short')
+    print(f"Short EURUSD: {'FILTERED' if should_filter else 'ALLOWED'} - {reason}")
+    
+    should_filter, reason = dxy_filter.should_filter_signal('USDJPY', 'long')
+    print(f"Long USDJPY: {'FILTERED' if should_filter else 'ALLOWED'} - {reason}")
+    
+    # Test position sizing
+    print("\nPosition Size Adjustments:")
+    print("-" * 50)
+    
+    base_size = 1.0
+    eur_adjusted = dxy_filter.adjust_position_size('EURUSD', base_size)
+    print(f"EURUSD: {base_size:.2f} -> {eur_adjusted:.2f} lots")
+    
+    jpy_adjusted = dxy_filter.adjust_position_size('USDJPY', base_size)
+    print(f"USDJPY: {base_size:.2f} -> {jpy_adjusted:.2f} lots")
+    
+    # Full analysis
+    print("\nFull Analysis:")
+    print("-" * 50)
+    analysis = dxy_filter.get_full_analysis(['EURUSD', 'USDJPY'])
+    print(f"DXY Trend: {analysis.dxy_trend.value}")
+    print(f"DXY Momentum: {analysis.dxy_momentum:.2f}%")
+    print(f"Portfolio Correlation: {analysis.portfolio_correlation:.3f}")
+    print(f"Diversification Score: {analysis.diversification_score:.3f}")

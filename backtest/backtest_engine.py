@@ -4,8 +4,8 @@ Backtesting Engine - Professional backtesting with Monte Carlo simulation and st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Union
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from dataclasses import dataclass, field, asdict
 import logging
 import json
 import warnings
@@ -13,22 +13,69 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from scipy.stats import norm, t, genextreme
+from scipy.stats import norm, t, genextreme, kurtosis, skew
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import hashlib
+import pickle
+import time
+from enum import Enum
+import traceback
 
+# Import local modules
 from core.risk_engine import RiskEngine
 from core.strategy_engine import StrategyEngine
 from core.data_engine import DataEngine
 from utils.indicators import TechnicalIndicators
-from utils.helpers import retry_with_backoff
+from utils.helpers import retry_with_backoff, safe_divide
 
 warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Enums and Constants
+# =============================================================================
+
+class Direction(Enum):
+    """Trade direction"""
+    LONG = "long"
+    SHORT = "short"
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+
+
+class ExitReason(Enum):
+    """Exit reason for trades"""
+    TAKE_PROFIT = "take_profit"
+    STOP_LOSS = "stop_loss"
+    TRAILING_STOP = "trailing_stop"
+    END_OF_BACKTEST = "end_of_backtest"
+    SIGNAL = "signal"
+    TIME_EXIT = "time_exit"
+
+
+class SlippageModel(Enum):
+    """Slippage calculation models"""
+    FIXED = "fixed"
+    PERCENTAGE = "percentage"
+    MARKET_IMPACT = "market_impact"
+
+
+class DataSource(Enum):
+    """Data source types"""
+    YFINANCE = "yfinance"
+    CSV = "csv"
+    MT5 = "mt5"
+    BINANCE = "binance"
+    DATABASE = "database"
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class BacktestConfig:
@@ -37,21 +84,38 @@ class BacktestConfig:
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     initial_capital: float = 100000.0
-    commission: float = 0.0001
+    commission: Union[float, Dict[str, float]] = 0.0001
     slippage: float = 0.0001
-    slippage_model: str = 'percentage'  # 'fixed', 'percentage', 'market_impact'
-    market_impact_params: Dict = field(default_factory=dict)
+    slippage_model: str = 'percentage'
+    market_impact_params: Dict[str, Any] = field(default_factory=lambda: {
+        'base_impact': 0.0001,
+        'volume_impact_factor': 0.5,
+        'spread_cost': 0.0001
+    })
     data_source: str = 'database'
-    data_quality: Dict = field(default_factory=lambda: {
+    data_quality: Dict[str, Any] = field(default_factory=lambda: {
         'sources': {
             'yfinance': {'enabled': True, 'priority': 1},
             'csv': {'enabled': False, 'priority': 2},
             'mt5': {'enabled': False, 'priority': 3},
             'binance': {'enabled': False, 'priority': 4}
-        }
+        },
+        'fill_gaps': True,
+        'detect_outliers': True,
+        'min_data_points': 100
     })
     symbols: List[str] = field(default_factory=list)
     timeframes: List[str] = field(default_factory=lambda: ['1D'])
+    
+    # Risk management
+    risk_management: Dict[str, Any] = field(default_factory=lambda: {
+        'risk_per_trade': 0.25,  # percentage
+        'max_position_size': 5.0,
+        'min_position_size': 0.005,
+        'max_correlation': 0.7,
+        'max_drawdown': 0.25,
+        'max_leverage': 2.0
+    })
     
     # Monte Carlo settings
     monte_carlo_enabled: bool = True
@@ -60,14 +124,19 @@ class BacktestConfig:
     
     # Stress testing
     stress_test_enabled: bool = True
-    stress_scenarios: List[Dict] = field(default_factory=list)
+    stress_scenarios: List[Dict[str, Any]] = field(default_factory=lambda: [
+        {'name': '2008 Crisis', 'equity_drop': -0.5, 'volatility_multiplier': 3.0},
+        {'name': 'COVID Crash', 'equity_drop': -0.35, 'volatility_multiplier': 2.5},
+        {'name': 'Flash Crash', 'equity_drop': -0.1, 'volatility_multiplier': 5.0}
+    ])
     
     # Output settings
-    output: Dict = field(default_factory=lambda: {
+    output: Dict[str, Any] = field(default_factory=lambda: {
         'save_trades': True,
         'save_equity_curve': True,
         'generate_report': True,
-        'plot_results': True
+        'plot_results': True,
+        'report_format': 'html'
     })
     save_trades: bool = True
     save_equity_curve: bool = True
@@ -97,7 +166,16 @@ class TradeResult:
     exit_reason: str
     signal_type: str
     regime: str
-    metadata: Dict = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        result = asdict(self)
+        # Convert datetime objects to strings
+        result['timestamp'] = self.timestamp.isoformat() if self.timestamp else None
+        result['entry_time'] = self.entry_time.isoformat() if self.entry_time else None
+        result['exit_time'] = self.exit_time.isoformat() if self.exit_time else None
+        return result
 
 
 @dataclass
@@ -150,8 +228,121 @@ class BacktestMetrics:
     mc_probability_of_ruin: float
     
     # Stress test metrics
-    stress_test_results: Dict = field(default_factory=dict)
+    stress_test_results: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return asdict(self)
+    
+    @classmethod
+    def create_empty(cls) -> 'BacktestMetrics':
+        """Create empty metrics object"""
+        return cls(
+            total_return=0,
+            annualized_return=0,
+            volatility=0,
+            sharpe_ratio=0,
+            sortino_ratio=0,
+            calmar_ratio=0,
+            omega_ratio=0,
+            total_trades=0,
+            winning_trades=0,
+            losing_trades=0,
+            win_rate=0,
+            avg_win=0,
+            avg_loss=0,
+            max_win=0,
+            max_loss=0,
+            profit_factor=0,
+            expectancy=0,
+            avg_r_multiple=0,
+            r_multiple_std=0,
+            max_drawdown=0,
+            max_drawdown_duration=0,
+            avg_drawdown=0,
+            recovery_factor=0,
+            ulcer_index=0,
+            var_95=0,
+            var_99=0,
+            cvar_95=0,
+            cvar_99=0,
+            tail_ratio=0,
+            gain_to_pain_ratio=0,
+            mc_expected_return=0,
+            mc_expected_sharpe=0,
+            mc_expected_max_dd=0,
+            mc_var_95=0,
+            mc_var_99=0,
+            mc_probability_of_ruin=0
+        )
 
+
+@dataclass
+class TradingSignal:
+    """Trading signal from strategy"""
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    quantity: float = 0.0
+    signal_type: str = "standard"
+    regime: str = "neutral"
+    confidence: float = 1.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: Optional[datetime] = None
+
+
+# =============================================================================
+# Signal Object Adapter
+# =============================================================================
+
+class SignalAdapter:
+    """Adapter to handle both dict and object signal types"""
+    
+    @staticmethod
+    def to_object(signal: Union[Dict[str, Any], TradingSignal, Any]) -> TradingSignal:
+        """Convert signal to TradingSignal object"""
+        if isinstance(signal, TradingSignal):
+            return signal
+        
+        if isinstance(signal, dict):
+            return TradingSignal(
+                symbol=signal.get('symbol', ''),
+                direction=signal.get('direction', 'long'),
+                entry_price=signal.get('entry_price', 0.0),
+                stop_loss=signal.get('stop_loss', 0.0),
+                take_profit=signal.get('take_profit', 0.0),
+                quantity=signal.get('quantity', 0.0),
+                signal_type=signal.get('signal_type', 'standard'),
+                regime=signal.get('regime', 'neutral'),
+                confidence=signal.get('confidence', 1.0),
+                metadata=signal.get('metadata', {}),
+                timestamp=signal.get('timestamp')
+            )
+        
+        # Try to access attributes
+        try:
+            return TradingSignal(
+                symbol=getattr(signal, 'symbol', ''),
+                direction=getattr(signal, 'direction', 'long'),
+                entry_price=getattr(signal, 'entry_price', 0.0),
+                stop_loss=getattr(signal, 'stop_loss', 0.0),
+                take_profit=getattr(signal, 'take_profit', 0.0),
+                quantity=getattr(signal, 'quantity', 0.0),
+                signal_type=getattr(signal, 'signal_type', 'standard'),
+                regime=getattr(signal, 'regime', 'neutral'),
+                confidence=getattr(signal, 'confidence', 1.0),
+                metadata=getattr(signal, 'metadata', {}),
+                timestamp=getattr(signal, 'timestamp', None)
+            )
+        except:
+            raise TypeError(f"Cannot convert {type(signal)} to TradingSignal")
+
+
+# =============================================================================
+# Backtest Engine
+# =============================================================================
 
 class BacktestEngine:
     """
@@ -167,61 +358,116 @@ class BacktestEngine:
     - Interactive visualizations
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize backtest engine
+        
+        Args:
+            config: Configuration dictionary
+        """
         # Initialize backtest config
-        self.config = BacktestConfig(**config['backtesting'])
+        self.config = self._create_config(config)
         
         # Extract symbols from assets config
-        if self.config.symbols is None or len(self.config.symbols) == 0:
-            self.config.symbols = []
-            # Add forex symbols
-            if config.get('assets', {}).get('forex', {}).get('enabled', False):
-                forex_symbols = config.get('assets', {}).get('forex', {}).get('symbols', [])
-                self.config.symbols.extend(forex_symbols)
-            # Add crypto symbols
-            if config.get('assets', {}).get('crypto', {}).get('enabled', False):
-                crypto_symbols = config.get('assets', {}).get('crypto', {}).get('symbols', [])
-                self.config.symbols.extend(crypto_symbols)
-            # Add indices symbols
-            if config.get('assets', {}).get('indices', {}).get('enabled', False):
-                indices_symbols = config.get('assets', {}).get('indices', {}).get('symbols', [])
-                self.config.symbols.extend(indices_symbols)
+        self._extract_symbols(config)
         
-        logger.info(f"Backtest will run on symbols: {', '.join(self.config.symbols)}")
-        
-        # Ensure data quality config includes yfinance
-        if 'yfinance' not in self.config.data_quality['sources']:
-            self.config.data_quality['sources']['yfinance'] = {'enabled': True, 'priority': 1}
-        
-        # Disable other sources to ensure yfinance is used
-        for source in ['csv', 'mt5', 'binance', 'binance_futures']:
-            if source in self.config.data_quality['sources']:
-                self.config.data_quality['sources'][source]['enabled'] = False
         self.logger = logging.getLogger(__name__)
         
-        # Initialize engines
-        self.risk_engine = RiskEngine(config)
-        self.strategy_engine = StrategyEngine(config)
-        self.data_engine = None  # Will be initialized per run
-        self.indicators = TechnicalIndicators()
+        # Initialize engines (lazy loading)
+        self._risk_engine = None
+        self._strategy_engine = None
+        self._data_engine = None
+        self._indicators = None
         
         # Results storage
         self.trades: List[TradeResult] = []
-        self.equity_curve: pd.Series = None
-        self.drawdown_curve: pd.Series = None
-        self.daily_returns: pd.Series = None
+        self.equity_curve: Optional[pd.Series] = None
+        self.drawdown_curve: Optional[pd.Series] = None
+        self.daily_returns: Optional[pd.Series] = None
         self.metrics: Optional[BacktestMetrics] = None
         
         # Monte Carlo results
         self.mc_equity_curves: List[pd.Series] = []
-        self.mc_metrics: List[Dict] = []
+        self.mc_metrics: List[Dict[str, float]] = []
         
         # Stress test results
-        self.stress_results: Dict = {}
+        self.stress_results: Dict[str, Dict[str, Any]] = {}
         
-        logger.info("BacktestEngine initialized")
+        # Signal adapter
+        self.signal_adapter = SignalAdapter()
+        
+        self.logger.info(f"BacktestEngine initialized with symbols: {', '.join(self.config.symbols)}")
     
-    async def run(self, strategy, data: Dict[str, pd.DataFrame] = None) -> BacktestMetrics:
+    def _create_config(self, config: Dict[str, Any]) -> BacktestConfig:
+        """Create BacktestConfig from dictionary"""
+        backtest_config = config.get('backtesting', {})
+        
+        # Convert string dates to datetime
+        if 'start_date' in backtest_config and isinstance(backtest_config['start_date'], str):
+            backtest_config['start_date'] = pd.to_datetime(backtest_config['start_date'])
+        if 'end_date' in backtest_config and isinstance(backtest_config['end_date'], str):
+            backtest_config['end_date'] = pd.to_datetime(backtest_config['end_date'])
+        
+        return BacktestConfig(**backtest_config)
+    
+    def _extract_symbols(self, config: Dict[str, Any]) -> None:
+        """Extract symbols from assets configuration"""
+        if self.config.symbols is None or len(self.config.symbols) == 0:
+            self.config.symbols = []
+            
+            # Add forex symbols
+            if config.get('assets', {}).get('forex', {}).get('enabled', False):
+                forex_symbols = config.get('assets', {}).get('forex', {}).get('symbols', [])
+                self.config.symbols.extend(forex_symbols)
+            
+            # Add crypto symbols
+            if config.get('assets', {}).get('crypto', {}).get('enabled', False):
+                crypto_symbols = config.get('assets', {}).get('crypto', {}).get('symbols', [])
+                self.config.symbols.extend(crypto_symbols)
+            
+            # Add indices symbols
+            if config.get('assets', {}).get('indices', {}).get('enabled', False):
+                indices_symbols = config.get('assets', {}).get('indices', {}).get('symbols', [])
+                self.config.symbols.extend(indices_symbols)
+    
+    @property
+    def risk_engine(self) -> RiskEngine:
+        """Lazy load risk engine"""
+        if self._risk_engine is None:
+            self._risk_engine = RiskEngine({})
+        return self._risk_engine
+    
+    @property
+    def strategy_engine(self) -> StrategyEngine:
+        """Lazy load strategy engine"""
+        if self._strategy_engine is None:
+            self._strategy_engine = StrategyEngine({})
+        return self._strategy_engine
+    
+    @property
+    def data_engine(self) -> DataEngine:
+        """Lazy load data engine"""
+        if self._data_engine is None:
+            from core.data_engine import DataEngine
+            data_config = {
+                'data_quality': self.config.data_quality,
+                'execution': {
+                    'mt5': {'enabled': False},
+                    'binance': {'enabled': False}
+                }
+            }
+            self._data_engine = DataEngine(data_config)
+        return self._data_engine
+    
+    @property
+    def indicators(self) -> 'TechnicalIndicators':
+        """Lazy load indicators"""
+        if self._indicators is None:
+            from utils.indicators import TechnicalIndicators
+            self._indicators = TechnicalIndicators()
+        return self._indicators
+    
+    async def run(self, strategy: Any, data: Optional[Dict[str, pd.DataFrame]] = None) -> BacktestMetrics:
         """
         Run comprehensive backtest
         
@@ -235,12 +481,18 @@ class BacktestEngine:
         self.logger.info(f"Starting backtest from {self.config.start_date} to {self.config.end_date}")
         
         try:
-            # Load data if not provided
+            # Initialize data engine if needed
             if data is None:
+                await self.data_engine.initialize()
                 data = await self._load_data()
             
             # Run main backtest
             self.trades, self.equity_curve = await self._run_backtest(strategy, data)
+            
+            if not self.trades:
+                self.logger.warning("No trades were executed during backtest")
+                self.metrics = BacktestMetrics.create_empty()
+                return self.metrics
             
             # Calculate returns and drawdown
             self.daily_returns = self.equity_curve.pct_change().dropna()
@@ -249,8 +501,8 @@ class BacktestEngine:
             # Calculate metrics
             self.metrics = self._calculate_metrics()
             
-            # Run Monte Carlo simulation (disabled)
-            if False:
+            # Run Monte Carlo simulation
+            if self.config.monte_carlo_enabled:
                 await self._run_monte_carlo()
             
             # Run stress tests
@@ -265,62 +517,78 @@ class BacktestEngine:
             if self.config.plot_results:
                 self._plot_results()
             
-            if self.metrics:
-                self.logger.info(f"Backtest completed. Total return: {self.metrics.total_return:.2f}%, Sharpe: {self.metrics.sharpe_ratio:.2f}")
-            else:
-                self.logger.info("Backtest completed. No trades were executed.")
+            # Save results
+            if self.config.save_trades or self.config.save_equity_curve:
+                self.save_results()
+            
+            self.logger.info(
+                f"Backtest completed. Total return: {self.metrics.total_return:.2f}%, "
+                f"Sharpe: {self.metrics.sharpe_ratio:.2f}, "
+                f"Trades: {self.metrics.total_trades}"
+            )
             
             return self.metrics
             
         except Exception as e:
             self.logger.error(f"Backtest failed: {e}", exc_info=True)
             raise
+        finally:
+            # Cleanup
+            if data is None and hasattr(self.data_engine, 'shutdown'):
+                await self.data_engine.shutdown()
     
     async def _load_data(self) -> Dict[str, pd.DataFrame]:
         """Load historical data for all symbols"""
-        # Create a complete config dict for DataEngine
-        data_config = {
-            'data_quality': self.config.data_quality,
-            'execution': {
-                'mt5': {'enabled': False},
-                'binance': {'enabled': False}
-            }
-        }
-        self.data_engine = DataEngine(data_config)
-        await self.data_engine.initialize()
-        
         data = {}
+        
         for symbol in self.config.symbols:
             for timeframe in self.config.timeframes:
-                df = await self.data_engine.get_historical_data(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start=self.config.start_date,
-                    end=self.config.end_date,
-                    quality_check=True,
-                    fill_gaps=True,
-                    detect_outliers=True
-                )
-                
-                if df is not None:
-                    key = f"{symbol}_{timeframe}"
-                    data[key] = df
-                    self.logger.info(f"Loaded {len(df)} bars for {key}")
+                try:
+                    df = await self.data_engine.get_historical_data(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start=self.config.start_date,
+                        end=self.config.end_date,
+                        quality_check=self.config.data_quality.get('fill_gaps', True),
+                        fill_gaps=self.config.data_quality.get('fill_gaps', True),
+                        detect_outliers=self.config.data_quality.get('detect_outliers', True)
+                    )
+                    
+                    if df is not None and len(df) >= self.config.data_quality.get('min_data_points', 100):
+                        key = f"{symbol}_{timeframe}"
+                        data[key] = df
+                        self.logger.info(f"Loaded {len(df)} bars for {key}")
+                    else:
+                        self.logger.warning(f"Insufficient data for {symbol} {timeframe}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to load data for {symbol} {timeframe}: {e}")
         
-        await self.data_engine.shutdown()
+        if not data:
+            raise ValueError("No data loaded for any symbol")
+        
         return data
     
-    async def _run_backtest(self, strategy, data: Dict[str, pd.DataFrame]) -> Tuple[List[TradeResult], pd.Series]:
+    async def _run_backtest(self, strategy: Any, data: Dict[str, pd.DataFrame]) -> Tuple[List[TradeResult], pd.Series]:
         """Execute main backtest"""
         all_trades = []
         equity = self.config.initial_capital
-        equity_curve = []
+        equity_history = []
+        open_positions = {}  # Track open positions by symbol
         
         # Get primary timeframe for equity curve
         primary_key = list(data.keys())[0]
         primary_df = data[primary_key]
         
+        total_bars = len(primary_df)
+        progress_interval = max(1, total_bars // 10)  # 10% progress updates
+        
         for idx, timestamp in enumerate(primary_df.index):
+            # Progress logging
+            if idx % progress_interval == 0:
+                progress = (idx / total_bars) * 100
+                self.logger.debug(f"Backtest progress: {progress:.1f}%")
+            
             # Get data slice up to current timestamp
             current_data = {}
             for key, df in data.items():
@@ -329,42 +597,85 @@ class BacktestEngine:
             # Generate signals for each symbol
             signals = []
             for key, df in current_data.items():
-                if df.empty:
+                if df.empty or len(df) < 50:  # Need minimum history
                     continue
                     
-                # Extract symbol (e.g., 'EURUSD' from 'EURUSD_1D')
-                if '_' in key:
-                    symbol = key.split('_')[0]
-                else:
-                    symbol = key
-                    
+                # Extract symbol from key
+                symbol = key.split('_')[0] if '_' in key else key
+                
                 # Generate signals for this symbol
                 try:
                     symbol_signals = await strategy.generate_trading_signals(df, symbol)
-                    signals.extend(symbol_signals)
+                    if symbol_signals:
+                        # Convert to list if single signal
+                        if not isinstance(symbol_signals, list):
+                            symbol_signals = [symbol_signals]
+                        
+                        # Add timestamp if missing
+                        for sig in symbol_signals:
+                            if hasattr(sig, 'timestamp') and sig.timestamp is None:
+                                sig.timestamp = timestamp
+                            elif isinstance(sig, dict) and 'timestamp' not in sig:
+                                sig['timestamp'] = timestamp
+                        
+                        signals.extend(symbol_signals)
                 except Exception as e:
                     self.logger.error(f"Failed to generate signals for {symbol}: {e}")
             
             # Process signals
-            for signal in signals:
-                # Pass the full data for SL/TP calculation
-                trade = await self._execute_trade(signal, timestamp, equity, primary_df)
+            for signal_obj in signals:
+                # Convert to TradingSignal object
+                try:
+                    signal = self.signal_adapter.to_object(signal_obj)
+                except Exception as e:
+                    self.logger.error(f"Failed to convert signal: {e}")
+                    continue
+                
+                # Check if we already have an open position for this symbol
+                if signal.symbol in open_positions:
+                    # Check for exit signal
+                    if signal.direction == 'exit' or signal.signal_type == 'exit':
+                        trade = await self._close_position(signal.symbol, timestamp, current_data[primary_key])
+                        if trade:
+                            all_trades.append(trade)
+                            equity += trade.profit
+                            del open_positions[signal.symbol]
+                    continue
+                
+                # Execute new trade
+                trade = await self._execute_trade(signal, timestamp, equity, current_data[primary_key])
                 if trade:
                     all_trades.append(trade)
                     equity += trade.profit
+                    open_positions[signal.symbol] = trade
             
-            equity_curve.append({
+            # Check for stop loss / take profit on open positions
+            for symbol in list(open_positions.keys()):
+                trade = await self._check_position_exit(symbol, timestamp, current_data[primary_key])
+                if trade:
+                    all_trades.append(trade)
+                    equity += trade.profit
+                    del open_positions[symbol]
+            
+            equity_history.append({
                 'timestamp': timestamp,
                 'equity': equity
             })
         
+        # Close any remaining positions at end of backtest
+        for symbol, position in open_positions.items():
+            trade = await self._force_close_position(symbol, primary_df.index[-1], primary_df)
+            if trade:
+                all_trades.append(trade)
+                equity += trade.profit
+        
         # Create equity curve Series
-        equity_df = pd.DataFrame(equity_curve)
+        equity_df = pd.DataFrame(equity_history)
         equity_series = pd.Series(equity_df['equity'].values, index=equity_df['timestamp'])
         
         return all_trades, equity_series
     
-    def _calculate_position_size(self, signal: Dict, current_equity: float) -> float:
+    def _calculate_position_size(self, signal: TradingSignal, current_equity: float) -> float:
         """Calculate position size based on risk management parameters"""
         # Get risk per trade from config (percentage)
         risk_per_trade = self.config.risk_management.get('risk_per_trade', 0.25) / 100
@@ -375,120 +686,76 @@ class BacktestEngine:
         # Calculate risk per unit (distance from entry to stop loss)
         risk_per_unit = abs(signal.entry_price - signal.stop_loss)
         
-        if risk_per_unit == 0:
+        if risk_per_unit == 0 or np.isnan(risk_per_unit):
             return 0.0
             
         # Calculate position size
         quantity = risk_amount / risk_per_unit
         
-        # Apply position size limits from config (using defaults since BacktestConfig doesn't include these fields)
-        min_size = 0.005
-        max_size = 5.0
+        # Apply position size limits
+        min_size = self.config.risk_management.get('min_position_size', 0.005)
+        max_size = self.config.risk_management.get('max_position_size', 5.0)
         
         return max(min_size, min(quantity, max_size))
     
-    async def _execute_trade(self, signal: Dict, timestamp: datetime, 
+    async def _execute_trade(self, signal: TradingSignal, timestamp: datetime, 
                            current_equity: float, data: pd.DataFrame) -> Optional[TradeResult]:
-        """Execute single trade with transaction costs and proper SL/TP logic"""
+        """Execute single trade with transaction costs"""
         
-        # Handle multi-tier exits and scaling-in for enhanced bearish strategy
-        if hasattr(signal, 'metadata') and 'multi_tier_exit' in signal.metadata:
+        # Check for multi-tier exit strategy
+        if signal.metadata and 'multi_tier_exit' in signal.metadata:
             return await self._execute_enhanced_trade(signal, timestamp, current_equity, data)
         
         # Calculate position size
         signal.quantity = self._calculate_position_size(signal, current_equity)
         
+        if signal.quantity <= 0:
+            return None
+        
         # Calculate commission
         commission = self._calculate_commission(signal)
         
         # Calculate slippage
-        slippage = self._calculate_slippage(signal)
+        slippage_pct = self._calculate_slippage(signal)
         
         # Adjust prices for slippage
-        if signal.direction == 'long':
-            entry_price = signal.entry_price * (1 + slippage)
-            tp_price = signal.take_profit * (1 + slippage)
-            sl_price = signal.stop_loss * (1 - slippage)
-        else:
-            entry_price = signal.entry_price * (1 - slippage)
-            tp_price = signal.take_profit * (1 - slippage)
-            sl_price = signal.stop_loss * (1 + slippage)
+        if signal.direction in ['long', 'bullish']:
+            entry_price = signal.entry_price * (1 + slippage_pct)
+            tp_price = signal.take_profit * (1 + slippage_pct)
+            sl_price = signal.stop_loss * (1 - slippage_pct)
+        else:  # short or bearish
+            entry_price = signal.entry_price * (1 - slippage_pct)
+            tp_price = signal.take_profit * (1 - slippage_pct)
+            sl_price = signal.stop_loss * (1 + slippage_pct)
         
-        # Debug: Print entry details
-        print(f"DEBUG: Signal at {timestamp}")
-        print(f"  Direction: {signal.direction}")
-        print(f"  Entry: {signal.entry_price:.2f} -> {entry_price:.2f}")
-        print(f"  SL: {signal.stop_loss:.2f} -> {sl_price:.2f}")
-        print(f"  TP: {signal.take_profit:.2f} -> {tp_price:.2f}")
+        self.logger.debug(f"Executing {signal.direction} trade at {timestamp}: "
+                         f"Entry={entry_price:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f}")
         
-        # Find exit time and price by checking future candles
-        trade_executed = False
-        exit_price = 0
-        exit_time = timestamp
-        exit_reason = ''
+        # Find exit
+        exit_result = self._find_exit(
+            data, timestamp, signal.direction, entry_price, sl_price, tp_price
+        )
         
-        # Get index of current timestamp
-        current_idx = data.index.get_loc(timestamp)
+        if not exit_result:
+            return None
         
-        # Look into future to find where SL or TP is hit
-        for i in range(current_idx + 1, len(data)):
-            next_timestamp = data.index[i]
-            high = data['high'].iloc[i]
-            low = data['low'].iloc[i]
-            close = data['close'].iloc[i]
-            
-            print(f"DEBUG: Next candle {next_timestamp}: H={high:.2f}, L={low:.2f}, C={close:.2f}")
-            
-            # Check if SL or TP is hit
-            if signal.direction == 'long':
-                # Long trade: TP is above entry, SL is below entry
-                if high >= tp_price:
-                    exit_price = tp_price
-                    exit_time = next_timestamp
-                    exit_reason = 'take_profit'
-                    trade_executed = True
-                    break
-                elif low <= sl_price:
-                    exit_price = sl_price
-                    exit_time = next_timestamp
-                    exit_reason = 'stop_loss'
-                    trade_executed = True
-                    break
-            else:
-                # Short trade: TP is below entry, SL is above entry
-                if low <= tp_price:
-                    exit_price = tp_price
-                    exit_time = next_timestamp
-                    exit_reason = 'take_profit'
-                    trade_executed = True
-                    break
-                elif high >= sl_price:
-                    exit_price = sl_price
-                    exit_time = next_timestamp
-                    exit_reason = 'stop_loss'
-                    trade_executed = True
-                    break
-        
-        # If no SL/TP hit, close at last available price
-        if not trade_executed:
-            exit_price = data['close'].iloc[-1]
-            exit_time = data.index[-1]
-            exit_reason = 'end_of_backtest'
-        
-        print(f"DEBUG: Exit at {exit_time}: {exit_price:.2f} ({exit_reason})")
+        exit_price, exit_time, exit_reason = exit_result
         
         # Calculate profit
-        if signal.direction == 'long':
+        if signal.direction in ['long', 'bullish']:
             profit = (exit_price - entry_price) * signal.quantity - commission
         else:
             profit = (entry_price - exit_price) * signal.quantity - commission
         
         # Calculate R-multiple
         risk = abs(entry_price - sl_price) * signal.quantity
-        r_multiple = profit / risk if risk > 0 else 0
+        r_multiple = safe_divide(profit, risk, 0.0)
         
         # Calculate holding period
         holding_period = (exit_time - timestamp).total_seconds() / 60  # Minutes
+        
+        # Calculate pips
+        profit_pips = self._calculate_pips(entry_price, exit_price, signal.symbol)
         
         # Create trade record
         trade = TradeResult(
@@ -500,9 +767,9 @@ class BacktestEngine:
             exit_price=exit_price,
             quantity=signal.quantity,
             commission=commission,
-            slippage=slippage * 10000,  # Convert to bps
+            slippage=slippage_pct * 10000,  # Convert to bps
             profit=profit,
-            profit_pips=self._calculate_pips(entry_price, exit_price, signal.symbol),
+            profit_pips=profit_pips,
             r_multiple=r_multiple,
             entry_time=timestamp,
             exit_time=exit_time,
@@ -510,189 +777,72 @@ class BacktestEngine:
             exit_reason=exit_reason,
             signal_type=signal.signal_type,
             regime=signal.regime,
-            metadata=signal
+            metadata=signal.metadata
         )
         
         return trade
     
-    async def _execute_enhanced_trade(self, signal: Dict, timestamp: datetime, 
+    async def _execute_enhanced_trade(self, signal: TradingSignal, timestamp: datetime,
                                      current_equity: float, data: pd.DataFrame) -> Optional[TradeResult]:
-        """Execute enhanced trade with trailing stop and scaling-in logic for both bearish and bullish strategies"""
+        """Execute enhanced trade with trailing stop and scaling-in logic"""
         
         # Calculate initial position size (50%)
-        initial_quantity = self._calculate_position_size(signal, current_equity) * 0.5
+        base_size = self._calculate_position_size(signal, current_equity)
+        initial_quantity = base_size * 0.5
         signal.quantity = initial_quantity
         
-        # Calculate commission
+        if initial_quantity <= 0:
+            return None
+        
+        # Calculate commission for initial position
         initial_commission = self._calculate_commission(signal)
         
         # Calculate slippage
-        slippage = self._calculate_slippage(signal)
+        slippage_pct = self._calculate_slippage(signal)
         
         # Adjust prices for slippage
-        if signal.direction == 'long' or signal.direction == 'bullish':
-            entry_price = signal.entry_price * (1 + slippage)
-            sl_price = signal.stop_loss * (1 - slippage)
-        else:  # bearish or short
-            entry_price = signal.entry_price * (1 - slippage)
-            sl_price = signal.stop_loss * (1 + slippage)
+        if signal.direction in ['long', 'bullish']:
+            entry_price = signal.entry_price * (1 + slippage_pct)
+            sl_price = signal.stop_loss * (1 - slippage_pct)
+        else:  # short or bearish
+            entry_price = signal.entry_price * (1 - slippage_pct)
+            sl_price = signal.stop_loss * (1 + slippage_pct)
         
-        # Debug: Print entry details
-        print(f"DEBUG: Enhanced Signal at {timestamp}")
-        print(f"  Direction: {signal.direction}")
-        print(f"  Entry: {signal.entry_price:.2f} -> {entry_price:.2f}")
-        print(f"  SL: {signal.stop_loss:.2f} -> {sl_price:.2f}")
-        print(f"  Initial Position: {initial_quantity:.4f}")
+        self.logger.debug(f"Executing enhanced {signal.direction} trade at {timestamp}")
         
-        # Get index of current timestamp
-        current_idx = data.index.get_loc(timestamp)
+        # Get trailing stop parameters
+        metadata = signal.metadata
+        activate_threshold = metadata.get('trailing_stop', {}).get('activate_threshold', 0.03)
+        trailing_percent = metadata.get('trailing_stop', {}).get('trailing_percent', 0.5)
+        scale_in_price = metadata.get('scaling', {}).get('scale_in_price', None)
         
-        # Initialize variables
-        trade_executed = False
-        exit_price = 0
-        exit_time = timestamp
-        exit_reason = ''
-        final_quantity = initial_quantity
-        total_commission = initial_commission
-        trailing_stop = None
-        activate_threshold = signal.metadata['trailing_stop']['activate_threshold']
-        trailing_percent = signal.metadata['trailing_stop']['trailing_percent']
-        scale_in_price = signal.metadata['scaling']['scale_in_price']
-        scale_in_quantity = initial_quantity  # Additional 50%
+        # Find exit with enhanced logic
+        exit_result = self._find_enhanced_exit(
+            data, timestamp, signal.direction, entry_price, sl_price,
+            activate_threshold, trailing_percent, scale_in_price,
+            base_size, signal
+        )
         
-        # Look into future to find where SL or TP is hit
-        for i in range(current_idx + 1, len(data)):
-            next_timestamp = data.index[i]
-            high = data['high'].iloc[i]
-            low = data['low'].iloc[i]
-            close = data['close'].iloc[i]
-            
-            print(f"DEBUG: Next candle {next_timestamp}: H={high:.2f}, L={low:.2f}, C={close:.2f}")
-            
-            # Check for scaling-in opportunity
-            if final_quantity == initial_quantity:
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if high >= scale_in_price:
-                        # Add scaling-in position
-                        signal.quantity = scale_in_quantity
-                        scale_in_commission = self._calculate_commission(signal)
-                        total_commission += scale_in_commission
-                        final_quantity += scale_in_quantity
-                        print(f"DEBUG: Scaled in at {next_timestamp}, New Quantity: {final_quantity:.4f}")
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if low <= scale_in_price:
-                        # Add scaling-in position
-                        signal.quantity = scale_in_quantity
-                        scale_in_commission = self._calculate_commission(signal)
-                        total_commission += scale_in_commission
-                        final_quantity += scale_in_quantity
-                        print(f"DEBUG: Scaled in at {next_timestamp}, New Quantity: {final_quantity:.4f}")
-            
-            # Handle trailing stop
-            if trailing_stop is None:
-                # Check if trailing stop should activate (3% from entry)
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if low <= entry_price * (1 - activate_threshold):
-                        trailing_stop = low * (1 + trailing_percent)
-                        print(f"DEBUG: Trailing stop activated at {trailing_stop:.2f}")
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if high >= entry_price * (1 + activate_threshold):
-                        trailing_stop = high * (1 - trailing_percent)
-                        print(f"DEBUG: Trailing stop activated at {trailing_stop:.2f}")
-            else:
-                # Update trailing stop
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if low < entry_price * (1 - activate_threshold):
-                        new_trailing = low * (1 + trailing_percent)
-                        if new_trailing < trailing_stop:
-                            trailing_stop = new_trailing
-                            print(f"DEBUG: Trailing stop updated to {trailing_stop:.2f}")
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if high > entry_price * (1 + activate_threshold):
-                        new_trailing = high * (1 - trailing_percent)
-                        if new_trailing > trailing_stop:
-                            trailing_stop = new_trailing
-                            print(f"DEBUG: Trailing stop updated to {trailing_stop:.2f}")
-            
-            # Check multi-tier take profit
-            tp_hit = False
-            for tp_level in signal.metadata['multi_tier_exit']:
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if low <= tp_level['level']:
-                        exit_price = tp_level['level']
-                        exit_time = next_timestamp
-                        exit_reason = f"take_profit_{tp_level['percentage']*100}%"
-                        trade_executed = True
-                        tp_hit = True
-                        print(f"DEBUG: TP hit at {exit_price:.2f} ({exit_reason})")
-                        break
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if high >= tp_level['level']:
-                        exit_price = tp_level['level']
-                        exit_time = next_timestamp
-                        exit_reason = f"take_profit_{tp_level['percentage']*100}%"
-                        trade_executed = True
-                        tp_hit = True
-                        print(f"DEBUG: TP hit at {exit_price:.2f} ({exit_reason})")
-                        break
-            if tp_hit:
-                break
-            
-            # Check stop loss or trailing stop
-            if trailing_stop:
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if high >= trailing_stop:
-                        exit_price = trailing_stop
-                        exit_time = next_timestamp
-                        exit_reason = 'trailing_stop'
-                        trade_executed = True
-                        print(f"DEBUG: Trailing stop hit at {exit_price:.2f}")
-                        break
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if low <= trailing_stop:
-                        exit_price = trailing_stop
-                        exit_time = next_timestamp
-                        exit_reason = 'trailing_stop'
-                        trade_executed = True
-                        print(f"DEBUG: Trailing stop hit at {exit_price:.2f}")
-                        break
-            else:
-                if signal.direction == 'bearish' or signal.direction == 'short':
-                    if high >= sl_price:
-                        exit_price = sl_price
-                        exit_time = next_timestamp
-                        exit_reason = 'stop_loss'
-                        trade_executed = True
-                        print(f"DEBUG: Stop loss hit at {exit_price:.2f}")
-                        break
-                elif signal.direction == 'bullish' or signal.direction == 'long':
-                    if low <= sl_price:
-                        exit_price = sl_price
-                        exit_time = next_timestamp
-                        exit_reason = 'stop_loss'
-                        trade_executed = True
-                        print(f"DEBUG: Stop loss hit at {exit_price:.2f}")
-                        break
+        if not exit_result:
+            return None
         
-        # If no SL/TP hit, close at last available price
-        if not trade_executed:
-            exit_price = data['close'].iloc[-1]
-            exit_time = data.index[-1]
-            exit_reason = 'end_of_backtest'
-            print(f"DEBUG: Exit at {exit_time}: {exit_price:.2f} ({exit_reason})")
+        exit_price, exit_time, exit_reason, final_quantity, total_commission = exit_result
         
         # Calculate profit
-        if signal.direction == 'long' or signal.direction == 'bullish':
+        if signal.direction in ['long', 'bullish']:
             profit = (exit_price - entry_price) * final_quantity - total_commission
         else:
             profit = (entry_price - exit_price) * final_quantity - total_commission
         
         # Calculate R-multiple
         risk = abs(entry_price - sl_price) * final_quantity
-        r_multiple = profit / risk if risk > 0 else 0
+        r_multiple = safe_divide(profit, risk, 0.0)
         
         # Calculate holding period
         holding_period = (exit_time - timestamp).total_seconds() / 60  # Minutes
+        
+        # Calculate pips
+        profit_pips = self._calculate_pips(entry_price, exit_price, signal.symbol)
         
         # Create trade record
         trade = TradeResult(
@@ -704,9 +854,9 @@ class BacktestEngine:
             exit_price=exit_price,
             quantity=final_quantity,
             commission=total_commission,
-            slippage=slippage * 10000,  # Convert to bps
+            slippage=slippage_pct * 10000,  # Convert to bps
             profit=profit,
-            profit_pips=self._calculate_pips(entry_price, exit_price, signal.symbol),
+            profit_pips=profit_pips,
             r_multiple=r_multiple,
             entry_time=timestamp,
             exit_time=exit_time,
@@ -714,15 +864,226 @@ class BacktestEngine:
             exit_reason=exit_reason,
             signal_type=signal.signal_type,
             regime=signal.regime,
-            metadata=signal
+            metadata=signal.metadata
         )
         
         return trade
     
-    def _calculate_commission(self, signal: Dict) -> float:
+    def _find_exit(self, data: pd.DataFrame, entry_time: datetime, direction: str,
+                  entry_price: float, sl_price: float, tp_price: float) -> Optional[Tuple[float, datetime, str]]:
+        """Find exit price and time by scanning future candles"""
+        
+        # Get index of current timestamp
+        try:
+            current_idx = data.index.get_loc(entry_time)
+        except KeyError:
+            return None
+        
+        trade_executed = False
+        exit_price = 0
+        exit_time = entry_time
+        exit_reason = ''
+        
+        # Look into future to find where SL or TP is hit
+        for i in range(current_idx + 1, len(data)):
+            next_timestamp = data.index[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+            
+            if direction in ['long', 'bullish']:
+                # Long trade: TP is above entry, SL is below entry
+                if high >= tp_price:
+                    exit_price = tp_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.TAKE_PROFIT.value
+                    trade_executed = True
+                    break
+                elif low <= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.STOP_LOSS.value
+                    trade_executed = True
+                    break
+            else:
+                # Short trade: TP is below entry, SL is above entry
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.TAKE_PROFIT.value
+                    trade_executed = True
+                    break
+                elif high >= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.STOP_LOSS.value
+                    trade_executed = True
+                    break
+        
+        # If no SL/TP hit, close at last available price
+        if not trade_executed:
+            exit_price = data['close'].iloc[-1]
+            exit_time = data.index[-1]
+            exit_reason = ExitReason.END_OF_BACKTEST.value
+        
+        return exit_price, exit_time, exit_reason
+    
+    def _find_enhanced_exit(self, data: pd.DataFrame, entry_time: datetime, direction: str,
+                          entry_price: float, sl_price: float, activate_threshold: float,
+                          trailing_percent: float, scale_in_price: Optional[float],
+                          base_size: float, signal: TradingSignal) -> Optional[Tuple[float, datetime, str, float, float]]:
+        """Find exit with trailing stop and scaling logic"""
+        
+        try:
+            current_idx = data.index.get_loc(entry_time)
+        except KeyError:
+            return None
+        
+        trade_executed = False
+        exit_price = 0
+        exit_time = entry_time
+        exit_reason = ''
+        final_quantity = base_size * 0.5
+        total_commission = self._calculate_commission(signal)
+        trailing_stop = None
+        scaled_in = False
+        
+        # Multi-tier take profit levels
+        tp_levels = []
+        if signal.metadata and 'multi_tier_exit' in signal.metadata:
+            tp_levels = sorted(
+                signal.metadata['multi_tier_exit'],
+                key=lambda x: x['percentage']
+            )
+        
+        for i in range(current_idx + 1, len(data)):
+            next_timestamp = data.index[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+            
+            # Check for scaling-in opportunity
+            if not scaled_in and scale_in_price is not None:
+                if direction in ['long', 'bullish'] and low <= scale_in_price:
+                    # Add scaling-in position
+                    signal.quantity = base_size * 0.5
+                    scale_commission = self._calculate_commission(signal)
+                    total_commission += scale_commission
+                    final_quantity += base_size * 0.5
+                    scaled_in = True
+                    self.logger.debug(f"Scaled in at {next_timestamp}, new size: {final_quantity}")
+                    
+                elif direction in ['short', 'bearish'] and high >= scale_in_price:
+                    signal.quantity = base_size * 0.5
+                    scale_commission = self._calculate_commission(signal)
+                    total_commission += scale_commission
+                    final_quantity += base_size * 0.5
+                    scaled_in = True
+                    self.logger.debug(f"Scaled in at {next_timestamp}, new size: {final_quantity}")
+            
+            # Handle trailing stop activation
+            if trailing_stop is None:
+                if direction in ['long', 'bullish'] and high >= entry_price * (1 + activate_threshold):
+                    trailing_stop = high * (1 - trailing_percent)
+                    self.logger.debug(f"Trailing stop activated at {trailing_stop:.2f}")
+                elif direction in ['short', 'bearish'] and low <= entry_price * (1 - activate_threshold):
+                    trailing_stop = low * (1 + trailing_percent)
+                    self.logger.debug(f"Trailing stop activated at {trailing_stop:.2f}")
+            else:
+                # Update trailing stop
+                if direction in ['long', 'bullish'] and high > entry_price * (1 + activate_threshold):
+                    new_trailing = high * (1 - trailing_percent)
+                    if new_trailing > trailing_stop:
+                        trailing_stop = new_trailing
+                        self.logger.debug(f"Trailing stop updated to {trailing_stop:.2f}")
+                elif direction in ['short', 'bearish'] and low < entry_price * (1 - activate_threshold):
+                    new_trailing = low * (1 + trailing_percent)
+                    if new_trailing < trailing_stop:
+                        trailing_stop = new_trailing
+                        self.logger.debug(f"Trailing stop updated to {trailing_stop:.2f}")
+            
+            # Check multi-tier take profit
+            for tp_level in tp_levels:
+                if direction in ['long', 'bullish'] and high >= tp_level['level']:
+                    exit_price = tp_level['level']
+                    exit_time = next_timestamp
+                    exit_reason = f"{ExitReason.TAKE_PROFIT.value}_{int(tp_level['percentage']*100)}%"
+                    trade_executed = True
+                    self.logger.debug(f"TP hit at {exit_price:.2f} ({exit_reason})")
+                    break
+                elif direction in ['short', 'bearish'] and low <= tp_level['level']:
+                    exit_price = tp_level['level']
+                    exit_time = next_timestamp
+                    exit_reason = f"{ExitReason.TAKE_PROFIT.value}_{int(tp_level['percentage']*100)}%"
+                    trade_executed = True
+                    self.logger.debug(f"TP hit at {exit_price:.2f} ({exit_reason})")
+                    break
+            
+            if trade_executed:
+                break
+            
+            # Check stop loss or trailing stop
+            if trailing_stop is not None:
+                if direction in ['long', 'bullish'] and low <= trailing_stop:
+                    exit_price = trailing_stop
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.TRAILING_STOP.value
+                    trade_executed = True
+                    self.logger.debug(f"Trailing stop hit at {exit_price:.2f}")
+                    break
+                elif direction in ['short', 'bearish'] and high >= trailing_stop:
+                    exit_price = trailing_stop
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.TRAILING_STOP.value
+                    trade_executed = True
+                    self.logger.debug(f"Trailing stop hit at {exit_price:.2f}")
+                    break
+            else:
+                if direction in ['long', 'bullish'] and low <= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.STOP_LOSS.value
+                    trade_executed = True
+                    self.logger.debug(f"Stop loss hit at {exit_price:.2f}")
+                    break
+                elif direction in ['short', 'bearish'] and high >= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = ExitReason.STOP_LOSS.value
+                    trade_executed = True
+                    self.logger.debug(f"Stop loss hit at {exit_price:.2f}")
+                    break
+        
+        # If no exit found, close at last price
+        if not trade_executed:
+            exit_price = data['close'].iloc[-1]
+            exit_time = data.index[-1]
+            exit_reason = ExitReason.END_OF_BACKTEST.value
+        
+        return exit_price, exit_time, exit_reason, final_quantity, total_commission
+    
+    async def _check_position_exit(self, symbol: str, timestamp: datetime, 
+                                  data: pd.DataFrame) -> Optional[TradeResult]:
+        """Check if existing position should be exited due to SL/TP"""
+        # This would require tracking open positions
+        # Simplified version - actual implementation would need position tracking
+        return None
+    
+    async def _close_position(self, symbol: str, timestamp: datetime, 
+                             data: pd.DataFrame) -> Optional[TradeResult]:
+        """Close position based on exit signal"""
+        # Simplified - actual implementation would need position data
+        return None
+    
+    async def _force_close_position(self, symbol: str, timestamp: datetime,
+                                   data: pd.DataFrame) -> Optional[TradeResult]:
+        """Force close position at end of backtest"""
+        # Simplified - actual implementation would need position data
+        return None
+    
+    def _calculate_commission(self, signal: TradingSignal) -> float:
         """Calculate transaction commission"""
         instrument = self._get_instrument_type(signal.symbol)
-        # Handle case where commission is a float instead of dict
+        
+        # Get commission rate
         if isinstance(self.config.commission, float):
             commission_rate = self.config.commission
         elif isinstance(self.config.commission, dict):
@@ -733,25 +1094,28 @@ class BacktestEngine:
         notional = signal.entry_price * signal.quantity
         return notional * commission_rate
     
-    def _calculate_slippage(self, signal: Dict) -> float:
+    def _calculate_slippage(self, signal: TradingSignal) -> float:
         """Calculate slippage based on model"""
-        if self.config.slippage_model == 'fixed':
+        model = SlippageModel(self.config.slippage_model)
+        
+        if model == SlippageModel.FIXED:
             return self.config.market_impact_params.get('base_impact', 0.0001)
         
-        elif self.config.slippage_model == 'percentage':
-            return 0.0001  # 0.01% slippage
+        elif model == SlippageModel.PERCENTAGE:
+            return self.config.slippage
         
-        elif self.config.slippage_model == 'market_impact':
+        elif model == SlippageModel.MARKET_IMPACT:
             # Almgren-Chriss market impact model
             params = self.config.market_impact_params
             base_impact = params.get('base_impact', 0.0001)
             volume_factor = params.get('volume_impact_factor', 0.5)
+            spread_cost = params.get('spread_cost', 0.0001)
             
             # Simplified impact calculation
             impact = base_impact * (1 + volume_factor * np.log(signal.quantity + 1))
-            return impact
+            return impact + spread_cost
         
-        return 0.0001
+        return self.config.slippage
     
     def _calculate_pips(self, entry: float, exit: float, symbol: str) -> float:
         """Calculate profit in pips"""
@@ -784,15 +1148,15 @@ class BacktestEngine:
     def _calculate_metrics(self) -> BacktestMetrics:
         """Calculate comprehensive performance metrics"""
         if not self.trades:
-            return None
+            return BacktestMetrics.create_empty()
         
         # Basic metrics
         total_return = (self.equity_curve.iloc[-1] / self.config.initial_capital - 1) * 100
         
         # Annualized return
         days = (self.equity_curve.index[-1] - self.equity_curve.index[0]).days
-        years = days / 365.25
-        annualized_return = ((1 + total_return / 100) ** (1 / years) - 1) * 100 if years > 0 else 0
+        years = max(days / 365.25, 0.01)  # Avoid division by zero
+        annualized_return = ((1 + total_return / 100) ** (1 / years) - 1) * 100
         
         # Volatility
         daily_returns = self.daily_returns
@@ -819,7 +1183,7 @@ class BacktestEngine:
         total_trades = len(self.trades)
         win_count = len(winning_trades)
         loss_count = len(losing_trades)
-        win_rate = win_count / total_trades * 100 if total_trades > 0 else 0
+        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
         
         avg_win = np.mean(winning_trades) if winning_trades else 0
         avg_loss = abs(np.mean(losing_trades)) if losing_trades else 0
@@ -828,7 +1192,7 @@ class BacktestEngine:
         
         gross_profit = sum(winning_trades)
         gross_loss = abs(sum(losing_trades))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        profit_factor = safe_divide(gross_profit, gross_loss, float('inf'))
         
         expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
         
@@ -861,7 +1225,11 @@ class BacktestEngine:
         
         # Recovery factor
         total_profit = self.equity_curve.iloc[-1] - self.config.initial_capital
-        recovery_factor = total_profit / (max_drawdown / 100 * self.config.initial_capital) if max_drawdown > 0 else float('inf')
+        recovery_factor = safe_divide(
+            total_profit,
+            (max_drawdown / 100 * self.config.initial_capital),
+            float('inf')
+        )
         
         # Ulcer index
         ulcer_index = np.sqrt((self.drawdown_curve ** 2).mean()) * 100
@@ -873,16 +1241,20 @@ class BacktestEngine:
         cvar_99 = daily_returns[daily_returns <= np.percentile(daily_returns, 1)].mean() * 100
         
         # Tail ratio
-        tail_ratio = abs(var_95 / var_99) if var_99 != 0 else 0
+        tail_ratio = safe_divide(abs(var_95), abs(var_99), 0)
         
         # Gain to pain ratio
-        gain_to_pain = total_profit / abs(sum(daily_returns[daily_returns < 0])) if any(daily_returns < 0) else float('inf')
+        gain_to_pain = safe_divide(
+            total_profit,
+            abs(sum(daily_returns[daily_returns < 0])),
+            float('inf')
+        )
         
         # Omega ratio
         threshold = 0
         gains = daily_returns[daily_returns > threshold].sum()
         losses = abs(daily_returns[daily_returns < threshold].sum())
-        omega = gains / losses if losses > 0 else float('inf')
+        omega = safe_divide(gains, losses, float('inf'))
         
         return BacktestMetrics(
             total_return=total_return,
@@ -927,17 +1299,20 @@ class BacktestEngine:
         """Run Monte Carlo simulation"""
         self.logger.info(f"Running {self.config.monte_carlo_simulations} Monte Carlo simulations...")
         
-        # Get trade distribution
         if not self.trades:
+            self.logger.warning("No trades to run Monte Carlo simulation")
             return
         
+        # Get trade distribution
         profits = [t.profit for t in self.trades]
         
         # Fit distribution to trade profits
         dist = self._fit_distribution(profits)
         
         # Run simulations in parallel
-        with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
+        n_workers = min(mp.cpu_count(), self.config.monte_carlo_simulations)
+        
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = []
             for i in range(self.config.monte_carlo_simulations):
                 future = executor.submit(
@@ -951,15 +1326,18 @@ class BacktestEngine:
             
             # Collect results
             for future in futures:
-                sim_equity, sim_metrics = future.result()
-                self.mc_equity_curves.append(sim_equity)
-                self.mc_metrics.append(sim_metrics)
+                try:
+                    sim_equity, sim_metrics = future.result(timeout=60)
+                    self.mc_equity_curves.append(pd.Series(sim_equity))
+                    self.mc_metrics.append(sim_metrics)
+                except Exception as e:
+                    self.logger.error(f"Monte Carlo simulation failed: {e}")
         
         # Calculate Monte Carlo metrics
         self._calculate_monte_carlo_metrics()
     
-    def _run_single_simulation(self, profits: List[float], dist, n_trades: int, 
-                              initial_capital: float) -> Tuple[pd.Series, Dict]:
+    def _run_single_simulation(self, profits: List[float], dist, n_trades: int,
+                              initial_capital: float) -> Tuple[np.ndarray, Dict[str, float]]:
         """Run single Monte Carlo simulation"""
         np.random.seed()  # Ensure different seeds per process
         
@@ -971,500 +1349,53 @@ class BacktestEngine:
         
         # Calculate metrics
         total_return = (equity[-1] / initial_capital - 1) * 100
-        max_dd = self._calculate_max_drawdown_from_series(equity)
-        sharpe = self._calculate_sharpe_from_series(equity)
         
-        return pd.Series(equity), {
+        # Max drawdown
+        peak = np.maximum.accumulate(equity)
+        drawdown = (peak - equity) / peak
+        max_dd = np.max(drawdown) * 100
+        
+        # Sharpe ratio
+        returns = np.diff(equity) / equity[:-1]
+        sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if len(returns) > 0 and np.std(returns) > 0 else 0
+        
+        return equity, {
             'total_return': total_return,
             'max_drawdown': max_dd,
             'sharpe_ratio': sharpe
         }
     
-    def _fit_distribution(self, data: List[float]) -> stats.rv_continuous:
+    def _fit_distribution(self, data: List[float]) -> Any:
         """Fit statistical distribution to data"""
         # Try different distributions
         distributions = [
-            stats.norm,
-            stats.t,
-            stats.laplace,
-            stats.genextreme
+            (stats.norm, stats.norm.fit(data)),
+            (stats.t, self._fit_t_distribution(data)),
+            (stats.laplace, stats.laplace.fit(data)),
+            (stats.genextreme, stats.genextreme.fit(data))
         ]
         
         best_dist = None
         best_aic = float('inf')
         
-        for dist in distributions:
+        for dist, params in distributions:
             try:
-                params = dist.fit(data)
                 aic = self._calculate_aic(dist, params, data)
                 if aic < best_aic:
                     best_aic = aic
-                    best_dist = (dist, params)
+                    best_dist = dist(*params)
             except:
                 continue
         
-        if best_dist:
-            dist, params = best_dist
-            return dist(*params)
-        
-        return stats.norm(*stats.norm.fit(data))
+        return best_dist or stats.norm(*stats.norm.fit(data))
     
-    def _calculate_aic(self, dist, params, data) -> float:
-        """Calculate Akaike Information Criterion"""
-        log_likelihood = np.sum(dist.logpdf(data, *params))
-        k = len(params)
-        return 2 * k - 2 * log_likelihood
-    
-    def _calculate_max_drawdown_from_series(self, equity: np.ndarray) -> float:
-        """Calculate max drawdown from equity series"""
-        peak = np.maximum.accumulate(equity)
-        drawdown = (peak - equity) / peak
-        return np.max(drawdown) * 100
-    
-    def _calculate_sharpe_from_series(self, equity: np.ndarray) -> float:
-        """Calculate Sharpe ratio from equity series"""
-        returns = np.diff(equity) / equity[:-1]
-        if len(returns) == 0 or np.std(returns) == 0:
-            return 0
-        return np.mean(returns) / np.std(returns) * np.sqrt(252)
-    
-    def _calculate_monte_carlo_metrics(self):
-        """Calculate Monte Carlo statistics"""
-        if not self.mc_metrics:
-            return
+    def _fit_t_distribution(self, data: List[float]) -> Tuple[float, float, float]:
+        """Fit t-distribution to data"""
+        # Try different degrees of freedom
+        best_df = 5
+        best_params = None
+        best_aic = float('inf')
         
-        # Extract metrics
-        returns = [m['total_return'] for m in self.mc_metrics]
-        drawdowns = [m['max_drawdown'] for m in self.mc_metrics]
-        sharpes = [m['sharpe_ratio'] for m in self.mc_metrics]
-        
-        # Update metrics
-        self.metrics.mc_expected_return = np.mean(returns)
-        self.metrics.mc_expected_sharpe = np.mean(sharpes)
-        self.metrics.mc_expected_max_dd = np.mean(drawdowns)
-        self.metrics.mc_var_95 = np.percentile(returns, 5)
-        self.metrics.mc_var_99 = np.percentile(returns, 1)
-        
-        # Probability of ruin (losing > 50%)
-        ruin_count = sum(1 for r in returns if r < -50)
-        self.metrics.mc_probability_of_ruin = ruin_count / len(returns)
-    
-    async def _run_stress_tests(self, data: Dict[str, pd.DataFrame]):
-        """Run stress test scenarios"""
-        self.logger.info("Running stress tests...")
-        
-        for scenario in self.config.stress_scenarios:
+        for df in [3, 4, 5, 6, 8, 10, 15]:
             try:
-                # Apply stress scenario to data
-                stressed_data = self._apply_stress_scenario(data, scenario)
-                
-                # Run backtest on stressed data
-                trades, equity = await self._run_backtest(self.strategy_engine, stressed_data)
-                
-                # Calculate metrics
-                returns = (equity.iloc[-1] / self.config.initial_capital - 1) * 100
-                max_dd = self._calculate_drawdown(equity).max() * 100
-                
-                self.stress_results[scenario['name']] = {
-                    'total_return': returns,
-                    'max_drawdown': max_dd,
-                    'survived': returns > -100  # Not bankrupt
-                }
-                
-                self.logger.info(f"Stress test {scenario['name']}: Return={returns:.1f}%, DD={max_dd:.1f}%")
-                
-            except Exception as e:
-                self.logger.error(f"Stress test {scenario['name']} failed: {e}")
-    
-    def _apply_stress_scenario(self, data: Dict[str, pd.DataFrame], 
-                              scenario: Dict) -> Dict[str, pd.DataFrame]:
-        """Apply stress scenario to data"""
-        stressed = {}
-        
-        for key, df in data.items():
-            df_stressed = df.copy()
-            
-            # Apply price shock
-            if 'equity_drop' in scenario:
-                shock = scenario['equity_drop']
-                df_stressed['close'] = df['close'] * (1 + shock)
-                df_stressed['open'] = df['open'] * (1 + shock)
-                df_stressed['high'] = df['high'] * (1 + shock)
-                df_stressed['low'] = df['low'] * (1 + shock)
-            
-            # Apply volatility shock
-            if 'volatility_multiplier' in scenario:
-                mult = scenario['volatility_multiplier']
-                returns = df['close'].pct_change()
-                stressed_returns = returns * mult
-                df_stressed['close'] = df['close'].iloc[0] * (1 + stressed_returns).cumprod()
-            
-            stressed[key] = df_stressed
-        
-        return stressed
-    
-    async def _generate_report(self):
-        """Generate comprehensive HTML/PDF report"""
-        report_dir = Path('reports')
-        report_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_path = report_dir / f"backtest_report_{timestamp}.html"
-        
-        # Generate HTML report
-        html = self._generate_html_report()
-        
-        with open(report_path, 'w') as f:
-            f.write(html)
-        
-        self.logger.info(f"Report saved to {report_path}")
-    
-    def _generate_html_report(self) -> str:
-        """Generate HTML report content"""
-        if not self.metrics:
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Backtest Report</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 40px; }}
-                    h1 {{ color: #333; }}
-                    .no-trades {{ text-align: center; padding: 50px; }}
-                </style>
-            </head>
-            <body>
-                <h1>Backtest Report</h1>
-                <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                
-                <div class="no-trades">
-                    <h2>No Trades Executed</h2>
-                    <p>The strategy did not generate any trading signals during the backtest period.</p>
-                    <p>This could be due to:</p>
-                    <ul style="text-align: left; display: inline-block;">
-                        <li>Market conditions not matching strategy criteria</li>
-                        <li>Conservative signal filters</li>
-                        <li>Short backtest period</li>
-                    </ul>
-                </div>
-            </body>
-            </html>
-            """
-            return html
-        
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Backtest Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; }}
-                h1 {{ color: #333; }}
-                .metrics {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }}
-                .metric-card {{ background: #f5f5f5; padding: 15px; border-radius: 5px; }}
-                .metric-value {{ font-size: 24px; font-weight: bold; color: #2196F3; }}
-                .metric-label {{ font-size: 14px; color: #666; }}
-                .positive {{ color: #4CAF50; }}
-                .negative {{ color: #F44336; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                th {{ background-color: #f2f2f2; }}
-            </style>
-        </head>
-        <body>
-            <h1>Backtest Report</h1>
-            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            
-            <h2>Summary</h2>
-            <div class="metrics">
-                <div class="metric-card">
-                    <div class="metric-value {'positive' if self.metrics.total_return > 0 else 'negative'}">
-                        {self.metrics.total_return:.2f}%
-                    </div>
-                    <div class="metric-label">Total Return</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-value">{self.metrics.sharpe_ratio:.2f}</div>
-                    <div class="metric-label">Sharpe Ratio</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-value">{self.metrics.max_drawdown:.2f}%</div>
-                    <div class="metric-label">Max Drawdown</div>
-                </div>
-            </div>
-            
-            <h2>Performance Metrics</h2>
-            <table>
-                <tr>
-                    <th>Metric</th>
-                    <th>Value</th>
-                </tr>
-                <tr>
-                    <td>Total Trades</td>
-                    <td>{self.metrics.total_trades}</td>
-                </tr>
-                <tr>
-                    <td>Win Rate</td>
-                    <td>{self.metrics.win_rate:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>Profit Factor</td>
-                    <td>{self.metrics.profit_factor:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Avg R-Multiple</td>
-                    <td>{self.metrics.avg_r_multiple:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Expectancy</td>
-                    <td>${self.metrics.expectancy:.2f}</td>
-                </tr>
-            </table>
-            
-            <h2>Risk Metrics</h2>
-            <table>
-                <tr>
-                    <th>Metric</th>
-                    <th>Value</th>
-                </tr>
-                <tr>
-                    <td>VaR (95%)</td>
-                    <td>{self.metrics.var_95:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>VaR (99%)</td>
-                    <td>{self.metrics.var_99:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>CVaR (95%)</td>
-                    <td>{self.metrics.cvar_95:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>CVaR (99%)</td>
-                    <td>{self.metrics.cvar_99:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>Ulcer Index</td>
-                    <td>{self.metrics.ulcer_index:.2f}</td>
-                </tr>
-            </table>
-            
-            <h2>Monte Carlo Results</h2>
-            <table>
-                <tr>
-                    <th>Metric</th>
-                    <th>Value</th>
-                </tr>
-                <tr>
-                    <td>Expected Return</td>
-                    <td>{self.metrics.mc_expected_return:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>Expected Sharpe</td>
-                    <td>{self.metrics.mc_expected_sharpe:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Expected Max DD</td>
-                    <td>{self.metrics.mc_expected_max_dd:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>VaR (95%) - MC</td>
-                    <td>{self.metrics.mc_var_95:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>VaR (99%) - MC</td>
-                    <td>{self.metrics.mc_var_99:.2f}%</td>
-                </tr>
-                <tr>
-                    <td>Probability of Ruin</td>
-                    <td>{self.metrics.mc_probability_of_ruin:.2%}</td>
-                </tr>
-            </table>
-        </body>
-        </html>
-        """
-        
-        return html
-    
-    def _plot_results(self):
-        """Generate interactive plots"""
-        fig = make_subplots(
-            rows=3, cols=2,
-            subplot_titles=('Equity Curve', 'Drawdown', 'Monthly Returns', 
-                          'Trade Distribution', 'Rolling Sharpe', 'Monte Carlo Bands'),
-            specs=[[{'secondary_y': True}, {}], [{}, {}], [{}, {}]]
-        )
-        
-        # Equity curve
-        fig.add_trace(
-            go.Scatter(x=self.equity_curve.index, y=self.equity_curve.values,
-                      mode='lines', name='Equity', line=dict(color='blue')),
-            row=1, col=1
-        )
-        
-        # Drawdown
-        fig.add_trace(
-            go.Scatter(x=self.drawdown_curve.index, y=self.drawdown_curve.values * 100,
-                      mode='lines', name='Drawdown', fill='tozeroy', line=dict(color='red')),
-            row=1, col=2
-        )
-        
-        # Monthly returns heatmap
-        if self.daily_returns is not None:
-            monthly_returns = self.daily_returns.resample('M').apply(lambda x: (1 + x).prod() - 1) * 100
-            years = monthly_returns.index.year
-            months = monthly_returns.index.month
-            
-            pivot = pd.pivot_table(
-                pd.DataFrame({'return': monthly_returns, 'year': years, 'month': months}),
-                values='return', index='month', columns='year', aggfunc='mean'
-            )
-            
-            fig.add_trace(
-                go.Heatmap(z=pivot.values, x=pivot.columns, y=pivot.index,
-                          colorscale='RdYlGn', name='Monthly Returns'),
-                row=2, col=1
-            )
-        
-        # Trade distribution
-        if self.trades:
-            profits = [t.profit for t in self.trades]
-            fig.add_trace(
-                go.Histogram(x=profits, nbinsx=50, name='Trade Distribution'),
-                row=2, col=2
-            )
-        
-        # Rolling Sharpe (60-day)
-        if self.daily_returns is not None and len(self.daily_returns) > 60:
-            rolling_sharpe = self.daily_returns.rolling(60).apply(
-                lambda x: np.sqrt(252) * x.mean() / x.std() if x.std() > 0 else 0
-            )
-            fig.add_trace(
-                go.Scatter(x=rolling_sharpe.index, y=rolling_sharpe.values,
-                          mode='lines', name='Rolling Sharpe (60d)'),
-                row=3, col=1
-            )
-        
-        # Monte Carlo bands
-        if self.mc_equity_curves:
-            mc_array = np.array([ec.values for ec in self.mc_equity_curves])
-            percentile_5 = np.percentile(mc_array, 5, axis=0)
-            percentile_95 = np.percentile(mc_array, 95, axis=0)
-            
-            fig.add_trace(
-                go.Scatter(x=self.equity_curve.index, y=percentile_95,
-                          mode='lines', name='MC 95%', line=dict(color='gray', dash='dash')),
-                row=3, col=2
-            )
-            fig.add_trace(
-                go.Scatter(x=self.equity_curve.index, y=percentile_5,
-                          mode='lines', name='MC 5%', line=dict(color='gray', dash='dash'),
-                          fill='tonexty'),
-                row=3, col=2
-            )
-        
-        fig.update_layout(height=1200, showlegend=True, title_text="Backtest Results")
-        
-        # Save plot
-        plot_path = Path('reports') / f"backtest_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        fig.write_html(plot_path)
-        
-        self.logger.info(f"Plot saved to {plot_path}")
-    
-    def _generate_trade_id(self, signal: Dict, timestamp: datetime) -> str:
-        """Generate unique trade ID"""
-        unique_str = f"{signal.symbol}_{timestamp}_{signal.direction}_{np.random.random()}"
-        return hashlib.md5(unique_str.encode()).hexdigest()[:12]
-    
-    def save_results(self, path: Optional[Path] = None):
-        """Save backtest results to disk"""
-        if path is None:
-            path = Path('backtest/results')
-        
-        path.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Save trades
-        if self.trades:
-            trades_df = pd.DataFrame([t.__dict__ for t in self.trades])
-            trades_df.to_csv(path / f'trades_{timestamp}.csv', index=False)
-        
-        # Save equity curve
-        if self.equity_curve is not None:
-            self.equity_curve.to_csv(path / f'equity_{timestamp}.csv')
-        
-        # Save metrics
-        if self.metrics:
-            metrics_dict = {k: v for k, v in self.metrics.__dict__.items() 
-                          if not isinstance(v, dict)}
-            with open(path / f'metrics_{timestamp}.json', 'w') as f:
-                json.dump(metrics_dict, f, indent=2, default=str)
-        
-        self.logger.info(f"Results saved to {path}")
-    
-    def print_summary(self):
-        """Print comprehensive performance summary"""
-        if not self.metrics:
-            print("No backtest results available")
-            return
-        
-        print("\n" + "="*60)
-        print("BACKTEST PERFORMANCE SUMMARY")
-        print("="*60)
-        
-        print("\nOVERALL PERFORMANCE:")
-        print(f"  Total Return: {self.metrics.total_return:+.2f}%")
-        print(f"  Annualized Return: {self.metrics.annualized_return:+.2f}%")
-        print(f"  Sharpe Ratio: {self.metrics.sharpe_ratio:.2f}")
-        print(f"  Sortino Ratio: {self.metrics.sortino_ratio:.2f}")
-        print(f"  Calmar Ratio: {self.metrics.calmar_ratio:.2f}")
-        print(f"  Omega Ratio: {self.metrics.omega_ratio:.2f}")
-        
-        print("\nTRADE STATISTICS:")
-        print(f"  Total Trades: {self.metrics.total_trades}")
-        print(f"  Winning Trades: {self.metrics.winning_trades}")
-        print(f"  Losing Trades: {self.metrics.losing_trades}")
-        print(f"  Win Rate: {self.metrics.win_rate:.2f}%")
-        print(f"  Profit Factor: {self.metrics.profit_factor:.2f}")
-        print(f"  Expectancy: ${self.metrics.expectancy:.2f}")
-        print(f"  Avg R-Multiple: {self.metrics.avg_r_multiple:.2f}")
-        
-        print("\nTRADE SIZES:")
-        print(f"  Avg Win: ${self.metrics.avg_win:.2f}")
-        print(f"  Avg Loss: -${self.metrics.avg_loss:.2f}")
-        print(f"  Max Win: ${self.metrics.max_win:.2f}")
-        print(f"  Max Loss: -${self.metrics.max_loss:.2f}")
-        
-        print("\nRISK METRICS:")
-        print(f"  Max Drawdown: {self.metrics.max_drawdown:.2f}%")
-        print(f"  Max DD Duration: {self.metrics.max_drawdown_duration} days")
-        print(f"  Avg Drawdown: {self.metrics.avg_drawdown:.2f}%")
-        print(f"  Recovery Factor: {self.metrics.recovery_factor:.2f}")
-        print(f"  Ulcer Index: {self.metrics.ulcer_index:.2f}")
-        
-        print("\nVALUE AT RISK:")
-        print(f"  VaR (95%): {self.metrics.var_95:.2f}%")
-        print(f"  VaR (99%): {self.metrics.var_99:.2f}%")
-        print(f"  CVaR (95%): {self.metrics.cvar_95:.2f}%")
-        print(f"  CVaR (99%): {self.metrics.cvar_99:.2f}%")
-        print(f"  Tail Ratio: {self.metrics.tail_ratio:.2f}")
-        print(f"  Gain/Pain Ratio: {self.metrics.gain_to_pain_ratio:.2f}")
-        
-        if self.config.monte_carlo_enabled and self.metrics.mc_expected_return != 0:
-            print("\n🎲 MONTE CARLO SIMULATION:")
-            print(f"  Expected Return: {self.metrics.mc_expected_return:.2f}%")
-            print(f"  Expected Sharpe: {self.metrics.mc_expected_sharpe:.2f}")
-            print(f"  Expected Max DD: {self.metrics.mc_expected_max_dd:.2f}%")
-            print(f"  VaR (95%) - MC: {self.metrics.mc_var_95:.2f}%")
-            print(f"  VaR (99%) - MC: {self.metrics.mc_var_99:.2f}%")
-            print(f"  Probability of Ruin: {self.metrics.mc_probability_of_ruin:.2%}")
-        
-        if self.stress_results:
-            print("\n🌪️ STRESS TEST RESULTS:")
-            for name, result in self.stress_results.items():
-                status = "✅" if result['survived'] else "❌"
-                print(f"  {status} {name}:")
-                print(f"     Return: {result['total_return']:.1f}%")
-                print(f"     Max DD: {result['max_drawdown']:.1f}%")
-        
-        print("\n" + "="*60)
+                params = stats.t.fit(data, f
