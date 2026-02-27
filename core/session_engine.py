@@ -480,31 +480,56 @@ class SessionEngine:
     
     def _apply_adaptive_parameters(self, config: SessionConfig, symbol: str) -> SessionConfig:
         """
-        Apply adaptive parameters based on historical performance
+        Apply adaptive parameters based on historical performance with validation
         """
+        # Validate input parameters
+        if not isinstance(config, SessionConfig):
+            raise TypeError("config must be an instance of SessionConfig")
+        if not isinstance(symbol, str) or len(symbol) < 3:
+            raise ValueError(f"Invalid symbol: {symbol} (must be at least 3 characters)")
+        
         # Get recent stats for this session
         recent_stats = self.session_stats.get(config.type, [])[-config.lookback_days:]
         
         if not recent_stats:
             return config
         
-        # Calculate average win rate
-        avg_win_rate = np.mean([s.win_rate for s in recent_stats if s.trades_taken > 0])
-        
-        # Adjust confidence threshold based on win rate
-        if avg_win_rate > 0.7:
-            config.min_confidence = max(0.5, config.min_confidence - 0.05)
-        elif avg_win_rate < 0.5:
-            config.min_confidence = min(0.8, config.min_confidence + 0.05)
-        
-        # Adjust volatility thresholds based on recent volatility
-        recent_volatility = self.volatility_history.get(config.type, [])
-        if recent_volatility:
-            avg_vol = np.mean(recent_volatility)
-            std_vol = np.std(recent_volatility)
+        # Calculate average win rate with validation
+        valid_stats = [s for s in recent_stats if s.trades_taken > 0]
+        if valid_stats:
+            avg_win_rate = np.mean([s.win_rate for s in valid_stats])
+            # Validate win rate is within reasonable range
+            avg_win_rate = np.clip(avg_win_rate, 0, 100)
             
-            config.min_volatility = max(5, avg_vol - std_vol)
-            config.max_volatility = avg_vol + std_vol
+            # Adjust confidence threshold based on win rate
+            if avg_win_rate > 70:  # 70% win rate
+                config.min_confidence = max(0.5, config.min_confidence - 0.05)
+            elif avg_win_rate < 50:  # 50% win rate
+                config.min_confidence = min(0.85, config.min_confidence + 0.05)
+        
+        # Adjust volatility thresholds based on recent volatility with validation
+        recent_volatility = self.volatility_history.get(config.type, [])
+        if recent_volatility and len(recent_volatility) >= 5:  # Need at least 5 data points
+            # Remove outliers (3 standard deviations from mean)
+            volatility_mean = np.mean(recent_volatility)
+            volatility_std = np.std(recent_volatility)
+            valid_volatility = [v for v in recent_volatility if abs(v - volatility_mean) <= 3 * volatility_std]
+            
+            if valid_volatility:
+                avg_vol = np.mean(valid_volatility)
+                std_vol = np.std(valid_volatility)
+                
+                # Calculate new volatility thresholds with bounds
+                new_min_vol = max(5, avg_vol - std_vol)
+                new_max_vol = min(200, avg_vol + std_vol)
+                
+                # Ensure min < max and thresholds are reasonable
+                if new_min_vol < new_max_vol and new_max_vol - new_min_vol >= 5:
+                    config.min_volatility = new_min_vol
+                    config.max_volatility = new_max_vol
+        
+        # Validate all adaptive parameters are within valid ranges
+        self._validate_adaptive_parameters(config)
         
         # Store adaptive parameters
         self.adaptive_parameters[config.type] = {
@@ -513,7 +538,34 @@ class SessionEngine:
             'max_volatility': config.max_volatility
         }
         
+        logger.debug(f"Adaptive parameters for {config.name} ({symbol}): "
+                     f"confidence={config.min_confidence:.2f}, "
+                     f"min_vol={config.min_volatility:.1f}, "
+                     f"max_vol={config.max_volatility:.1f}")
+        
         return config
+    
+    def _validate_adaptive_parameters(self, config: SessionConfig):
+        """Validate adaptive parameters are within valid ranges"""
+        # Validate confidence threshold
+        if not isinstance(config.min_confidence, (int, float)):
+            raise TypeError("min_confidence must be a number")
+        if config.min_confidence < 0.5 or config.min_confidence > 0.95:
+            raise ValueError(f"min_confidence must be between 0.5 and 0.95, got {config.min_confidence}")
+        
+        # Validate volatility thresholds
+        if not isinstance(config.min_volatility, (int, float)) or not isinstance(config.max_volatility, (int, float)):
+            raise TypeError("Volatility thresholds must be numbers")
+        if config.min_volatility <= 0 or config.max_volatility <= 0:
+            raise ValueError(f"Volatility thresholds must be positive, got min={config.min_volatility}, max={config.max_volatility}")
+        if config.min_volatility >= config.max_volatility:
+            raise ValueError(f"min_volatility ({config.min_volatility}) must be less than max_volatility ({config.max_volatility})")
+        if config.max_volatility - config.min_volatility < 5:
+            raise ValueError(f"Volatility range must be at least 5, got {config.max_volatility - config.min_volatility}")
+        
+        # Ensure volatility thresholds are within reasonable bounds
+        config.min_volatility = max(5, min(config.min_volatility, 100))
+        config.max_volatility = max(config.min_volatility + 5, min(config.max_volatility, 200))
     
     def _calculate_risk_multiplier(self, config: SessionConfig, volatility: float) -> float:
         """

@@ -82,8 +82,9 @@ def setup_logging(config: Dict[str, Any]) -> logging.Logger:
         root_logger.addHandler(file_handler)
     
     # Set level for noisy libraries
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('asyncio').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('asyncio').setLevel(logging.ERROR)
+    logging.getLogger('ccxt').setLevel(logging.ERROR)
     
     # Create logger for this module
     logger = logging.getLogger(__name__)

@@ -169,22 +169,38 @@ class DataEngine:
         
         # Background tasks not implemented yet
         self._running = True
-        logger.info("✅ Data Engine initialized successfully")
+        logger.info("Data Engine initialized successfully")
     
     async def shutdown(self):
         """Shutdown the data engine"""
         logger.info("Shutting down Data Engine...")
         self._running = False
         
-        # Close CCXT exchanges
-        for exchange_name, exchange in self.ccxt_exchanges.items():
+        # Close Binance connections
+        if self.binance_client:
             try:
-                await exchange.close()
-                logger.info(f"✅ {exchange_name} exchange closed")
+                await self.binance_client.close_connection()
+                logger.info("✅ Binance client closed")
             except Exception as e:
-                logger.warning(f"Failed to close {exchange_name} exchange: {e}")
+                logger.warning(f"Failed to close Binance client: {e}")
         
-        logger.info("✅ Data Engine shutdown complete")
+        if self.binance_futures_client:
+            try:
+                await self.binance_futures_client.close_connection()
+                logger.info("✅ Binance Futures client closed")
+            except Exception as e:
+                logger.warning(f"Failed to close Binance Futures client: {e}")
+        
+        # Close CCXT exchanges (if any initialized)
+        if hasattr(self, 'ccxt_exchanges') and self.ccxt_exchanges:
+            for exchange_name, exchange in self.ccxt_exchanges.items():
+                try:
+                    await exchange.close()
+                    logger.info(f"✅ {exchange_name} exchange closed")
+                except Exception as e:
+                    logger.warning(f"Failed to close {exchange_name} exchange: {e}")
+        
+        logger.info("Data Engine shutdown complete")
     
     async def _init_redis(self):
         """Initialize Redis with connection pool"""
@@ -270,28 +286,9 @@ class DataEngine:
             self.data_sources_status['binance'] = False
     
     async def _init_ccxt(self):
-        """Initialize CCXT exchanges"""
-        exchanges = ['binance', 'bybit', 'okx', 'kucoin', 'bitget']
-        
-        for exchange_id in exchanges:
-            try:
-                exchange_class = getattr(ccxt, exchange_id)
-                exchange = exchange_class({
-                    'enableRateLimit': True,
-                    'rateLimit': 1200,
-                    'options': {
-                        'defaultType': 'spot',
-                        'adjustForTimeDifference': True
-                    }
-                })
-                await exchange.load_markets()
-                self.ccxt_exchanges[exchange_id] = exchange
-                self.data_sources_status[exchange_id] = True
-                logger.info(f"✅ CCXT {exchange_id} initialized")
-                
-            except Exception as e:
-                logger.warning(f"Failed to initialize {exchange_id}: {e}")
-                self.data_sources_status[exchange_id] = False
+        """Initialize CCXT exchanges - DISABLED"""
+        logger.info("CCXT exchanges initialization disabled")
+        return
     
     async def _init_additional_sources(self):
         """Initialize additional data sources"""
@@ -436,10 +433,6 @@ class DataEngine:
                 'USDCAD': 'CAD=X',
                 'NZDUSD': 'NZDUSD=X',
                 'USDCHF': 'CHF=X',
-                'BTCUSDT': 'BTC-USD',
-                'ETHUSDT': 'ETH-USD',
-                'BNBUSDT': 'BNB-USD',
-                'SOLUSDT': 'SOL-USD',
                 'US30': 'DJIA',
                 'SPX500': 'SPY',
                 'NAS100': 'QQQ'
@@ -452,9 +445,12 @@ class DataEngine:
             df = ticker.history(start=start, end=end, interval=timeframe.lower())
             
             if not df.empty:
-                logger.info(f"✅ Successfully downloaded {len(df)} bars for {symbol} from Yahoo Finance")
+                logger.info(f"Successfully downloaded {len(df)} bars for {symbol} from Yahoo Finance")
                 # Rename columns to lowercase
                 df.columns = [col.lower() for col in df.columns]
+                # Convert timezone-aware index to naive UTC datetime
+                if df.index.tz is not None:
+                    df.index = df.index.tz_convert('UTC').tz_localize(None)
                 return df
             else:
                 logger.warning(f"⚠️ No data available for {symbol} from Yahoo Finance")

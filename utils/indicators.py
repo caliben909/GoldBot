@@ -52,6 +52,14 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_correlation(series1: pd.Series, series2: pd.Series, period: int = 20) -> pd.Series:
         return calculate_correlation(series1, series2, period)
+    
+    @staticmethod
+    def calculate_fibonacci_levels(high: float, low: float) -> dict:
+        return calculate_fibonacci_levels(high, low)
+    
+    @staticmethod
+    def calculate_fibonacci_retracement(df: pd.DataFrame, lookback_period: int = 20) -> pd.DataFrame:
+        return calculate_fibonacci_retracement(df, lookback_period)
 
 
 def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
@@ -326,3 +334,91 @@ def calculate_correlation(series1: pd.Series, series2: pd.Series, period: int = 
         Series of correlation values
     """
     return series1.rolling(period).corr(series2)
+
+
+def calculate_fibonacci_levels(high: float, low: float) -> dict:
+    """
+    Calculate Fibonacci retracement and extension levels
+    
+    Args:
+        high: Highest point in the trend
+        low: Lowest point in the trend
+    
+    Returns:
+        Dictionary of Fibonacci levels
+    """
+    # Fibonacci retracement levels
+    retracement_levels = {
+        '0.0': high,
+        '0.236': high - (0.236 * (high - low)),
+        '0.382': high - (0.382 * (high - low)),
+        '0.5': high - (0.5 * (high - low)),
+        '0.618': high - (0.618 * (high - low)),
+        '0.786': high - (0.786 * (high - low)),
+        '1.0': low
+    }
+    
+    # Fibonacci extension levels
+    extension_levels = {
+        '1.272': low - (0.272 * (high - low)),
+        '1.382': low - (0.382 * (high - low)),
+        '1.5': low - (0.5 * (high - low)),
+        '1.618': low - (0.618 * (high - low)),
+        '2.0': low - (1.0 * (high - low)),
+        '2.618': low - (1.618 * (high - low))
+    }
+    
+    return {
+        'retracement': retracement_levels,
+        'extension': extension_levels
+    }
+
+
+def calculate_fibonacci_retracement(df: pd.DataFrame, lookback_period: int = 20) -> pd.DataFrame:
+    """
+    Calculate Fibonacci retracement levels for each bar based on recent swing points
+    
+    Args:
+        df: DataFrame with high, low, close columns
+        lookback_period: Number of bars to look back for swing points
+    
+    Returns:
+        DataFrame with Fibonacci levels
+    """
+    fib_levels = pd.DataFrame(index=df.index)
+    
+    # Calculate swing highs and lows
+    swing_high = (
+        (df['high'] > df['high'].shift(1)) &
+        (df['high'] > df['high'].shift(2)) &
+        (df['high'] > df['high'].shift(-1)) &
+        (df['high'] > df['high'].shift(-2))
+    )
+    
+    swing_low = (
+        (df['low'] < df['low'].shift(1)) &
+        (df['low'] < df['low'].shift(2)) &
+        (df['low'] < df['low'].shift(-1)) &
+        (df['low'] < df['low'].shift(-2))
+    )
+    
+    # Get recent swing points
+    recent_high = df['high'].rolling(lookback_period).max()
+    recent_low = df['low'].rolling(lookback_period).min()
+    
+    # Calculate Fibonacci levels for each point
+    for level in ['0.0', '0.236', '0.382', '0.5', '0.618', '0.786', '1.0']:
+        fib_levels[f'fib_{level}'] = recent_high - (float(level) * (recent_high - recent_low))
+    
+    # Calculate distance to nearest Fibonacci level
+    def nearest_fib(row):
+        close = df.loc[row.name, 'close']
+        levels = [row[f'fib_{l}'] for l in ['0.0', '0.236', '0.382', '0.5', '0.618', '0.786', '1.0']]
+        distances = [abs(close - l) for l in levels]
+        nearest = levels[distances.index(min(distances))]
+        return nearest
+    
+    fib_levels['nearest_fib'] = fib_levels.apply(nearest_fib, axis=1)
+    fib_levels['distance_to_fib'] = abs(df['close'] - fib_levels['nearest_fib'])
+    
+    return fib_levels

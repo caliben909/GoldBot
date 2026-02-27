@@ -142,6 +142,12 @@ class LiquidityEngine:
         """
         Complete market analysis including all SMC concepts
         """
+        # Reset internal state for each analysis to prevent carryover from previous bars
+        self.active_order_blocks.clear()
+        self.mitigated_order_blocks.clear()
+        self.fvg_zones.clear()
+        self.liquidity_zones.clear()
+        
         result = {
             'structure': self._analyze_structure(df),
             'order_blocks': self._analyze_order_blocks(df),

@@ -132,12 +132,18 @@ class WinRateOptimizer:
         self.logger.info("2. Optimizing signal validation parameters...")
         
         # Increase minimum confidence threshold
+        if 'ai_filter' not in self.config['strategy']:
+            self.config['strategy']['ai_filter'] = {}
         self.config['strategy']['ai_filter']['confidence_threshold'] = 0.85
         
         # Require more confluences
+        if 'confluence' not in self.config['strategy']:
+            self.config['strategy']['confluence'] = {}
         self.config['strategy']['confluence']['min_confluences'] = 4
         
         # Tighten SMC requirements
+        if 'smc' not in self.config['strategy']:
+            self.config['strategy']['smc'] = {}
         self.config['strategy']['smc']['require_choch'] = True
         self.config['strategy']['smc']['require_bos'] = True
         self.config['strategy']['smc']['require_liquidity_sweep'] = True
@@ -155,15 +161,21 @@ class WinRateOptimizer:
         
         # Reduce risk per trade for higher precision
         self.config['risk_management']['max_risk_per_trade'] = 0.25
+        if 'position_sizing' not in self.config['risk_management']:
+            self.config['risk_management']['position_sizing'] = {}
         self.config['risk_management']['position_sizing']['base_risk'] = 0.25
         self.config['risk_management']['max_daily_risk'] = 1.0
         
         # Early breakeven to protect capital
+        if 'exits' not in self.config['risk_management']:
+            self.config['risk_management']['exits'] = {}
         self.config['risk_management']['exits']['breakeven_at'] = 0.5  # Move to breakeven at 0.5R
         self.config['risk_management']['exits']['trail_at'] = 0.8     # Start trailing at 0.8R
         self.config['risk_management']['exits']['trail_distance'] = 0.3  # Tight trailing
         
         # Scale down after fewer losses
+        if 'scaling' not in self.config['risk_management']:
+            self.config['risk_management']['scaling'] = {}
         self.config['risk_management']['scaling']['scale_down_after_losses'] = 1
         self.config['risk_management']['scaling']['scale_down_factor'] = 0.3
         self.config['risk_management']['scaling']['max_consecutive_losses'] = 2
@@ -214,6 +226,8 @@ class WinRateOptimizer:
         self.logger.info("6. Optimizing kill zone parameters...")
         
         # Enable kill zone trading for higher precision entry points
+        if 'kill_zone' not in self.config['strategy']:
+            self.config['strategy']['kill_zone'] = {}
         self.config['strategy']['kill_zone']['enabled'] = True
         self.config['strategy']['kill_zone']['duration'] = 30  # minutes before session open/close
         self.config['strategy']['kill_zone']['require_liquidity'] = True

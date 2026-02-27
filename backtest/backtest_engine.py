@@ -249,8 +249,8 @@ class BacktestEngine:
             # Calculate metrics
             self.metrics = self._calculate_metrics()
             
-            # Run Monte Carlo simulation
-            if self.config.monte_carlo_enabled:
+            # Run Monte Carlo simulation (disabled)
+            if False:
                 await self._run_monte_carlo()
             
             # Run stress tests
@@ -265,7 +265,10 @@ class BacktestEngine:
             if self.config.plot_results:
                 self._plot_results()
             
-            self.logger.info(f"Backtest completed. Total return: {self.metrics.total_return:.2f}%, Sharpe: {self.metrics.sharpe_ratio:.2f}")
+            if self.metrics:
+                self.logger.info(f"Backtest completed. Total return: {self.metrics.total_return:.2f}%, Sharpe: {self.metrics.sharpe_ratio:.2f}")
+            else:
+                self.logger.info("Backtest completed. No trades were executed.")
             
             return self.metrics
             
@@ -344,7 +347,8 @@ class BacktestEngine:
             
             # Process signals
             for signal in signals:
-                trade = await self._execute_trade(signal, timestamp, equity)
+                # Pass the full data for SL/TP calculation
+                trade = await self._execute_trade(signal, timestamp, equity, primary_df)
                 if trade:
                     all_trades.append(trade)
                     equity += trade.profit
@@ -363,7 +367,7 @@ class BacktestEngine:
     def _calculate_position_size(self, signal: Dict, current_equity: float) -> float:
         """Calculate position size based on risk management parameters"""
         # Get risk per trade from config (percentage)
-        risk_per_trade = self.config.get('risk_management', {}).get('max_risk_per_trade', 0.25) / 100
+        risk_per_trade = self.config.risk_management.get('risk_per_trade', 0.25) / 100
         
         # Calculate risk amount in currency
         risk_amount = current_equity * risk_per_trade
@@ -377,15 +381,19 @@ class BacktestEngine:
         # Calculate position size
         quantity = risk_amount / risk_per_unit
         
-        # Apply position size limits from config
-        min_size = self.config.get('risk_management', {}).get('position_sizing', {}).get('min_position_size', 0.005)
-        max_size = self.config.get('risk_management', {}).get('position_sizing', {}).get('max_position_size', 5.0)
+        # Apply position size limits from config (using defaults since BacktestConfig doesn't include these fields)
+        min_size = 0.005
+        max_size = 5.0
         
         return max(min_size, min(quantity, max_size))
     
     async def _execute_trade(self, signal: Dict, timestamp: datetime, 
-                           current_equity: float) -> Optional[TradeResult]:
-        """Execute single trade with transaction costs"""
+                           current_equity: float, data: pd.DataFrame) -> Optional[TradeResult]:
+        """Execute single trade with transaction costs and proper SL/TP logic"""
+        
+        # Handle multi-tier exits and scaling-in for enhanced bearish strategy
+        if hasattr(signal, 'metadata') and 'multi_tier_exit' in signal.metadata:
+            return await self._execute_enhanced_trade(signal, timestamp, current_equity, data)
         
         # Calculate position size
         signal.quantity = self._calculate_position_size(signal, current_equity)
@@ -397,31 +405,97 @@ class BacktestEngine:
         slippage = self._calculate_slippage(signal)
         
         # Adjust prices for slippage
-        if signal['direction'] == 'long':
+        if signal.direction == 'long':
             entry_price = signal.entry_price * (1 + slippage)
-            exit_price = signal['take_profit'] * (1 - slippage)
-            stop_price = signal['stop_loss'] * (1 - slippage)
+            tp_price = signal.take_profit * (1 + slippage)
+            sl_price = signal.stop_loss * (1 - slippage)
         else:
             entry_price = signal.entry_price * (1 - slippage)
-            exit_price = signal['take_profit'] * (1 + slippage)
-            stop_price = signal['stop_loss'] * (1 + slippage)
+            tp_price = signal.take_profit * (1 - slippage)
+            sl_price = signal.stop_loss * (1 + slippage)
+        
+        # Debug: Print entry details
+        print(f"DEBUG: Signal at {timestamp}")
+        print(f"  Direction: {signal.direction}")
+        print(f"  Entry: {signal.entry_price:.2f} -> {entry_price:.2f}")
+        print(f"  SL: {signal.stop_loss:.2f} -> {sl_price:.2f}")
+        print(f"  TP: {signal.take_profit:.2f} -> {tp_price:.2f}")
+        
+        # Find exit time and price by checking future candles
+        trade_executed = False
+        exit_price = 0
+        exit_time = timestamp
+        exit_reason = ''
+        
+        # Get index of current timestamp
+        current_idx = data.index.get_loc(timestamp)
+        
+        # Look into future to find where SL or TP is hit
+        for i in range(current_idx + 1, len(data)):
+            next_timestamp = data.index[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+            close = data['close'].iloc[i]
+            
+            print(f"DEBUG: Next candle {next_timestamp}: H={high:.2f}, L={low:.2f}, C={close:.2f}")
+            
+            # Check if SL or TP is hit
+            if signal.direction == 'long':
+                # Long trade: TP is above entry, SL is below entry
+                if high >= tp_price:
+                    exit_price = tp_price
+                    exit_time = next_timestamp
+                    exit_reason = 'take_profit'
+                    trade_executed = True
+                    break
+                elif low <= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = 'stop_loss'
+                    trade_executed = True
+                    break
+            else:
+                # Short trade: TP is below entry, SL is above entry
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_time = next_timestamp
+                    exit_reason = 'take_profit'
+                    trade_executed = True
+                    break
+                elif high >= sl_price:
+                    exit_price = sl_price
+                    exit_time = next_timestamp
+                    exit_reason = 'stop_loss'
+                    trade_executed = True
+                    break
+        
+        # If no SL/TP hit, close at last available price
+        if not trade_executed:
+            exit_price = data['close'].iloc[-1]
+            exit_time = data.index[-1]
+            exit_reason = 'end_of_backtest'
+        
+        print(f"DEBUG: Exit at {exit_time}: {exit_price:.2f} ({exit_reason})")
         
         # Calculate profit
-        if signal['direction'] == 'long':
+        if signal.direction == 'long':
             profit = (exit_price - entry_price) * signal.quantity - commission
         else:
             profit = (entry_price - exit_price) * signal.quantity - commission
         
         # Calculate R-multiple
-        risk = abs(entry_price - stop_price) * signal.quantity
+        risk = abs(entry_price - sl_price) * signal.quantity
         r_multiple = profit / risk if risk > 0 else 0
+        
+        # Calculate holding period
+        holding_period = (exit_time - timestamp).total_seconds() / 60  # Minutes
         
         # Create trade record
         trade = TradeResult(
             trade_id=self._generate_trade_id(signal, timestamp),
             timestamp=timestamp,
             symbol=signal.symbol,
-            direction=signal['direction'],
+            direction=signal.direction,
             entry_price=entry_price,
             exit_price=exit_price,
             quantity=signal.quantity,
@@ -431,11 +505,215 @@ class BacktestEngine:
             profit_pips=self._calculate_pips(entry_price, exit_price, signal.symbol),
             r_multiple=r_multiple,
             entry_time=timestamp,
-            exit_time=timestamp + timedelta(hours=1),  # Simplified
-            holding_period=60,  # Minutes
-            exit_reason='take_profit',
-            signal_type=signal.get('signal_type', 'unknown'),
-            regime=signal.get('regime', 'unknown'),
+            exit_time=exit_time,
+            holding_period=holding_period,
+            exit_reason=exit_reason,
+            signal_type=signal.signal_type,
+            regime=signal.regime,
+            metadata=signal
+        )
+        
+        return trade
+    
+    async def _execute_enhanced_trade(self, signal: Dict, timestamp: datetime, 
+                                     current_equity: float, data: pd.DataFrame) -> Optional[TradeResult]:
+        """Execute enhanced trade with trailing stop and scaling-in logic for both bearish and bullish strategies"""
+        
+        # Calculate initial position size (50%)
+        initial_quantity = self._calculate_position_size(signal, current_equity) * 0.5
+        signal.quantity = initial_quantity
+        
+        # Calculate commission
+        initial_commission = self._calculate_commission(signal)
+        
+        # Calculate slippage
+        slippage = self._calculate_slippage(signal)
+        
+        # Adjust prices for slippage
+        if signal.direction == 'long' or signal.direction == 'bullish':
+            entry_price = signal.entry_price * (1 + slippage)
+            sl_price = signal.stop_loss * (1 - slippage)
+        else:  # bearish or short
+            entry_price = signal.entry_price * (1 - slippage)
+            sl_price = signal.stop_loss * (1 + slippage)
+        
+        # Debug: Print entry details
+        print(f"DEBUG: Enhanced Signal at {timestamp}")
+        print(f"  Direction: {signal.direction}")
+        print(f"  Entry: {signal.entry_price:.2f} -> {entry_price:.2f}")
+        print(f"  SL: {signal.stop_loss:.2f} -> {sl_price:.2f}")
+        print(f"  Initial Position: {initial_quantity:.4f}")
+        
+        # Get index of current timestamp
+        current_idx = data.index.get_loc(timestamp)
+        
+        # Initialize variables
+        trade_executed = False
+        exit_price = 0
+        exit_time = timestamp
+        exit_reason = ''
+        final_quantity = initial_quantity
+        total_commission = initial_commission
+        trailing_stop = None
+        activate_threshold = signal.metadata['trailing_stop']['activate_threshold']
+        trailing_percent = signal.metadata['trailing_stop']['trailing_percent']
+        scale_in_price = signal.metadata['scaling']['scale_in_price']
+        scale_in_quantity = initial_quantity  # Additional 50%
+        
+        # Look into future to find where SL or TP is hit
+        for i in range(current_idx + 1, len(data)):
+            next_timestamp = data.index[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+            close = data['close'].iloc[i]
+            
+            print(f"DEBUG: Next candle {next_timestamp}: H={high:.2f}, L={low:.2f}, C={close:.2f}")
+            
+            # Check for scaling-in opportunity
+            if final_quantity == initial_quantity:
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if high >= scale_in_price:
+                        # Add scaling-in position
+                        signal.quantity = scale_in_quantity
+                        scale_in_commission = self._calculate_commission(signal)
+                        total_commission += scale_in_commission
+                        final_quantity += scale_in_quantity
+                        print(f"DEBUG: Scaled in at {next_timestamp}, New Quantity: {final_quantity:.4f}")
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if low <= scale_in_price:
+                        # Add scaling-in position
+                        signal.quantity = scale_in_quantity
+                        scale_in_commission = self._calculate_commission(signal)
+                        total_commission += scale_in_commission
+                        final_quantity += scale_in_quantity
+                        print(f"DEBUG: Scaled in at {next_timestamp}, New Quantity: {final_quantity:.4f}")
+            
+            # Handle trailing stop
+            if trailing_stop is None:
+                # Check if trailing stop should activate (3% from entry)
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if low <= entry_price * (1 - activate_threshold):
+                        trailing_stop = low * (1 + trailing_percent)
+                        print(f"DEBUG: Trailing stop activated at {trailing_stop:.2f}")
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if high >= entry_price * (1 + activate_threshold):
+                        trailing_stop = high * (1 - trailing_percent)
+                        print(f"DEBUG: Trailing stop activated at {trailing_stop:.2f}")
+            else:
+                # Update trailing stop
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if low < entry_price * (1 - activate_threshold):
+                        new_trailing = low * (1 + trailing_percent)
+                        if new_trailing < trailing_stop:
+                            trailing_stop = new_trailing
+                            print(f"DEBUG: Trailing stop updated to {trailing_stop:.2f}")
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if high > entry_price * (1 + activate_threshold):
+                        new_trailing = high * (1 - trailing_percent)
+                        if new_trailing > trailing_stop:
+                            trailing_stop = new_trailing
+                            print(f"DEBUG: Trailing stop updated to {trailing_stop:.2f}")
+            
+            # Check multi-tier take profit
+            tp_hit = False
+            for tp_level in signal.metadata['multi_tier_exit']:
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if low <= tp_level['level']:
+                        exit_price = tp_level['level']
+                        exit_time = next_timestamp
+                        exit_reason = f"take_profit_{tp_level['percentage']*100}%"
+                        trade_executed = True
+                        tp_hit = True
+                        print(f"DEBUG: TP hit at {exit_price:.2f} ({exit_reason})")
+                        break
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if high >= tp_level['level']:
+                        exit_price = tp_level['level']
+                        exit_time = next_timestamp
+                        exit_reason = f"take_profit_{tp_level['percentage']*100}%"
+                        trade_executed = True
+                        tp_hit = True
+                        print(f"DEBUG: TP hit at {exit_price:.2f} ({exit_reason})")
+                        break
+            if tp_hit:
+                break
+            
+            # Check stop loss or trailing stop
+            if trailing_stop:
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if high >= trailing_stop:
+                        exit_price = trailing_stop
+                        exit_time = next_timestamp
+                        exit_reason = 'trailing_stop'
+                        trade_executed = True
+                        print(f"DEBUG: Trailing stop hit at {exit_price:.2f}")
+                        break
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if low <= trailing_stop:
+                        exit_price = trailing_stop
+                        exit_time = next_timestamp
+                        exit_reason = 'trailing_stop'
+                        trade_executed = True
+                        print(f"DEBUG: Trailing stop hit at {exit_price:.2f}")
+                        break
+            else:
+                if signal.direction == 'bearish' or signal.direction == 'short':
+                    if high >= sl_price:
+                        exit_price = sl_price
+                        exit_time = next_timestamp
+                        exit_reason = 'stop_loss'
+                        trade_executed = True
+                        print(f"DEBUG: Stop loss hit at {exit_price:.2f}")
+                        break
+                elif signal.direction == 'bullish' or signal.direction == 'long':
+                    if low <= sl_price:
+                        exit_price = sl_price
+                        exit_time = next_timestamp
+                        exit_reason = 'stop_loss'
+                        trade_executed = True
+                        print(f"DEBUG: Stop loss hit at {exit_price:.2f}")
+                        break
+        
+        # If no SL/TP hit, close at last available price
+        if not trade_executed:
+            exit_price = data['close'].iloc[-1]
+            exit_time = data.index[-1]
+            exit_reason = 'end_of_backtest'
+            print(f"DEBUG: Exit at {exit_time}: {exit_price:.2f} ({exit_reason})")
+        
+        # Calculate profit
+        if signal.direction == 'long' or signal.direction == 'bullish':
+            profit = (exit_price - entry_price) * final_quantity - total_commission
+        else:
+            profit = (entry_price - exit_price) * final_quantity - total_commission
+        
+        # Calculate R-multiple
+        risk = abs(entry_price - sl_price) * final_quantity
+        r_multiple = profit / risk if risk > 0 else 0
+        
+        # Calculate holding period
+        holding_period = (exit_time - timestamp).total_seconds() / 60  # Minutes
+        
+        # Create trade record
+        trade = TradeResult(
+            trade_id=self._generate_trade_id(signal, timestamp),
+            timestamp=timestamp,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=final_quantity,
+            commission=total_commission,
+            slippage=slippage * 10000,  # Convert to bps
+            profit=profit,
+            profit_pips=self._calculate_pips(entry_price, exit_price, signal.symbol),
+            r_multiple=r_multiple,
+            entry_time=timestamp,
+            exit_time=exit_time,
+            holding_period=holding_period,
+            exit_reason=exit_reason,
+            signal_type=signal.signal_type,
+            regime=signal.regime,
             metadata=signal
         )
         
@@ -461,7 +739,7 @@ class BacktestEngine:
             return self.config.market_impact_params.get('base_impact', 0.0001)
         
         elif self.config.slippage_model == 'percentage':
-            return signal.entry_price * 0.0001
+            return 0.0001  # 0.01% slippage
         
         elif self.config.slippage_model == 'market_impact':
             # Almgren-Chriss market impact model
@@ -843,6 +1121,37 @@ class BacktestEngine:
     
     def _generate_html_report(self) -> str:
         """Generate HTML report content"""
+        if not self.metrics:
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Backtest Report</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                    h1 {{ color: #333; }}
+                    .no-trades {{ text-align: center; padding: 50px; }}
+                </style>
+            </head>
+            <body>
+                <h1>Backtest Report</h1>
+                <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                
+                <div class="no-trades">
+                    <h2>No Trades Executed</h2>
+                    <p>The strategy did not generate any trading signals during the backtest period.</p>
+                    <p>This could be due to:</p>
+                    <ul style="text-align: left; display: inline-block;">
+                        <li>Market conditions not matching strategy criteria</li>
+                        <li>Conservative signal filters</li>
+                        <li>Short backtest period</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+            """
+            return html
+        
         html = f"""
         <!DOCTYPE html>
         <html>
@@ -1064,7 +1373,7 @@ class BacktestEngine:
     
     def _generate_trade_id(self, signal: Dict, timestamp: datetime) -> str:
         """Generate unique trade ID"""
-        unique_str = f"{signal.symbol}_{timestamp}_{signal.get('direction', '')}_{np.random.random()}"
+        unique_str = f"{signal.symbol}_{timestamp}_{signal.direction}_{np.random.random()}"
         return hashlib.md5(unique_str.encode()).hexdigest()[:12]
     
     def save_results(self, path: Optional[Path] = None):
@@ -1103,7 +1412,7 @@ class BacktestEngine:
         print("BACKTEST PERFORMANCE SUMMARY")
         print("="*60)
         
-        print("\n📊 OVERALL PERFORMANCE:")
+        print("\nOVERALL PERFORMANCE:")
         print(f"  Total Return: {self.metrics.total_return:+.2f}%")
         print(f"  Annualized Return: {self.metrics.annualized_return:+.2f}%")
         print(f"  Sharpe Ratio: {self.metrics.sharpe_ratio:.2f}")
@@ -1111,7 +1420,7 @@ class BacktestEngine:
         print(f"  Calmar Ratio: {self.metrics.calmar_ratio:.2f}")
         print(f"  Omega Ratio: {self.metrics.omega_ratio:.2f}")
         
-        print("\n📈 TRADE STATISTICS:")
+        print("\nTRADE STATISTICS:")
         print(f"  Total Trades: {self.metrics.total_trades}")
         print(f"  Winning Trades: {self.metrics.winning_trades}")
         print(f"  Losing Trades: {self.metrics.losing_trades}")
@@ -1120,20 +1429,20 @@ class BacktestEngine:
         print(f"  Expectancy: ${self.metrics.expectancy:.2f}")
         print(f"  Avg R-Multiple: {self.metrics.avg_r_multiple:.2f}")
         
-        print("\n💰 TRADE SIZES:")
+        print("\nTRADE SIZES:")
         print(f"  Avg Win: ${self.metrics.avg_win:.2f}")
         print(f"  Avg Loss: -${self.metrics.avg_loss:.2f}")
         print(f"  Max Win: ${self.metrics.max_win:.2f}")
         print(f"  Max Loss: -${self.metrics.max_loss:.2f}")
         
-        print("\n📉 RISK METRICS:")
+        print("\nRISK METRICS:")
         print(f"  Max Drawdown: {self.metrics.max_drawdown:.2f}%")
         print(f"  Max DD Duration: {self.metrics.max_drawdown_duration} days")
         print(f"  Avg Drawdown: {self.metrics.avg_drawdown:.2f}%")
         print(f"  Recovery Factor: {self.metrics.recovery_factor:.2f}")
         print(f"  Ulcer Index: {self.metrics.ulcer_index:.2f}")
         
-        print("\n🎲 VALUE AT RISK:")
+        print("\nVALUE AT RISK:")
         print(f"  VaR (95%): {self.metrics.var_95:.2f}%")
         print(f"  VaR (99%): {self.metrics.var_99:.2f}%")
         print(f"  CVaR (95%): {self.metrics.cvar_95:.2f}%")

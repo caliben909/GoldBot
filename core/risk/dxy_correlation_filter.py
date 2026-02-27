@@ -135,7 +135,7 @@ class DXYCorrelationFilter:
     async def calculate_correlations(self, symbols: List[str], 
                                    as_of: Optional[datetime] = None) -> DXYCorrelationResult:
         """
-        Calculate DXY correlations for multiple symbols
+        Calculate DXY correlations for multiple symbols with improved accuracy
         
         Args:
             symbols: List of symbols to analyze
@@ -161,6 +161,7 @@ class DXYCorrelationFilter:
         eligible_symbols = []
         filtered_symbols = []
         position_size_adjustments = {}
+        correlation_stabilities = {}
         
         # Calculate correlations for each symbol
         for symbol in symbols:
@@ -177,7 +178,7 @@ class DXYCorrelationFilter:
                 logger.debug(f"Not enough common data points for {symbol}: {len(common_dates)}")
                 continue
                 
-            # Calculate correlation
+            # Calculate correlation with significance test
             if self.config.correlation_method == 'pearson':
                 corr, p_value = pearsonr(
                     dxy_returns.loc[common_dates],
@@ -189,19 +190,23 @@ class DXYCorrelationFilter:
                     symbol_returns.loc[common_dates]
                 )
             
+            # Calculate correlation stability using rolling windows
+            stability = await self._calculate_correlation_stability(symbol, common_dates)
+            
             # Calculate correlation strength (absolute value)
             strength = abs(corr)
             
             correlations[symbol] = corr
             correlation_strengths[symbol] = strength
+            correlation_stabilities[symbol] = stability
             
             # Check eligibility based on correlation
-            eligible = await self._is_symbol_eligible(symbol, corr, strength)
+            eligible = await self._is_symbol_eligible(symbol, corr, strength, stability, p_value)
             if eligible:
                 eligible_symbols.append(symbol)
                 
                 # Calculate position size adjustment
-                adjustment = await self._calculate_position_size_adjustment(symbol, corr, strength)
+                adjustment = await self._calculate_position_size_adjustment(symbol, corr, strength, stability)
                 position_size_adjustments[symbol] = adjustment
             else:
                 filtered_symbols.append(symbol)
@@ -223,7 +228,7 @@ class DXYCorrelationFilter:
         # Get current DXY price
         current_dxy_price = self.dxy_price_history.iloc[-1] if not self.dxy_price_history.empty else 0.0
         
-        return DXYCorrelationResult(
+        result = DXYCorrelationResult(
             timestamp=as_of,
             dxy_price=current_dxy_price,
             dxy_returns=dxy_returns,
@@ -239,10 +244,60 @@ class DXYCorrelationFilter:
             portfolio_correlation=portfolio_correlation,
             diversification_score=diversification_score
         )
+        
+        # Add stability information to metadata
+        setattr(result, 'correlation_stabilities', correlation_stabilities)
+        
+        return result
+    
+    async def _calculate_correlation_stability(self, symbol: str, common_dates: pd.DatetimeIndex) -> float:
+        """Calculate correlation stability using rolling windows"""
+        symbol_prices = self.symbol_price_history[symbol]
+        symbol_returns = symbol_prices.pct_change().dropna()
+        dxy_returns = self.dxy_price_history.pct_change().dropna()
+        
+        # Calculate rolling correlations over different time windows
+        window_sizes = [10, 20, 30]
+        correlation_stabilities = []
+        
+        for window in window_sizes:
+            if len(common_dates) >= window * 2:
+                # Calculate correlations for two consecutive windows
+                symbol_returns1 = symbol_returns.loc[common_dates[-window*2:-window]]
+                dxy_returns1 = dxy_returns.loc[common_dates[-window*2:-window]]
+                
+                symbol_returns2 = symbol_returns.loc[common_dates[-window:]]
+                dxy_returns2 = dxy_returns.loc[common_dates[-window:]]
+                
+                # Calculate correlations for each window
+                if self.config.correlation_method == 'pearson':
+                    corr1, _ = pearsonr(dxy_returns1, symbol_returns1)
+                    corr2, _ = pearsonr(dxy_returns2, symbol_returns2)
+                else:
+                    corr1, _ = spearmanr(dxy_returns1, symbol_returns1)
+                    corr2, _ = spearmanr(dxy_returns2, symbol_returns2)
+                
+                # Calculate stability score (1 - absolute difference)
+                stability = 1 - abs(corr1 - corr2)
+                correlation_stabilities.append(stability)
+        
+        if correlation_stabilities:
+            return np.mean(correlation_stabilities)
+        return 0.5
     
     async def _is_symbol_eligible(self, symbol: str, correlation: float, 
-                                strength: float) -> bool:
-        """Check if symbol is eligible based on correlation criteria"""
+                                strength: float, stability: float, p_value: float) -> bool:
+        """Check if symbol is eligible based on correlation criteria with improved validation"""
+        # Check significance level
+        if p_value > 0.05:
+            logger.debug(f"{symbol} filtered: Correlation not statistically significant (p-value: {p_value:.2f})")
+            return False
+        
+        # Check stability
+        if stability < 0.6:
+            logger.debug(f"{symbol} filtered: Correlation stability too low ({stability:.2f})")
+            return False
+        
         # Check if symbol has specific threshold
         if symbol in self.config.symbol_correlation_thresholds:
             threshold = self.config.symbol_correlation_thresholds[symbol]
@@ -268,42 +323,181 @@ class DXYCorrelationFilter:
     
     async def _calculate_position_size_adjustment(self, symbol: str, 
                                                  correlation: float, 
-                                                 strength: float) -> float:
-        """Calculate position size adjustment based on correlation"""
+                                                 strength: float, 
+                                                 stability: float) -> float:
+        """Calculate position size adjustment based on correlation and stability"""
         if not self.config.adjust_position_size_by_correlation:
             return 1.0
         
         # Base adjustment on correlation strength
         adjustment = 1.0 - (strength * self.config.correlation_sizing_multiplier)
+        
+        # Adjust based on stability (lower stability = more reduction)
+        stability_factor = 0.5 + (stability * 0.5)  # Scale from 0.5 to 1.0
+        adjustment *= stability_factor
+        
+        # Ensure adjustment doesn't drop below minimum
         adjustment = max(1.0 - self.config.max_correlation_sizing_reduction, adjustment)
         
-        logger.debug(f"{symbol} position size adjustment: {adjustment:.2f}")
+        logger.debug(f"{symbol} position size adjustment: {adjustment:.2f} (strength: {strength:.2f}, stability: {stability:.2f})")
         return adjustment
     
     async def _calculate_trend_confidence(self, symbol: str, correlation: float) -> float:
-        """Calculate trend confidence based on correlation consistency"""
+        """Calculate dynamic trend confidence based on correlation consistency and stability"""
         if symbol not in self.symbol_price_history or self.dxy_price_history.empty:
             return 0.0
         
-        # Simple trend confidence calculation based on recent correlation stability
-        return 0.8  # Placeholder - would be more complex in production
+        # Get price history for symbol and DXY
+        symbol_prices = self.symbol_price_history[symbol]
+        dxy_prices = self.dxy_price_history
+        
+        # Calculate rolling correlations over different time windows to measure stability
+        window_sizes = [10, 20, 30]
+        correlation_stability_scores = []
+        
+        for window in window_sizes:
+            if len(symbol_prices) >= window * 2 and len(dxy_prices) >= window * 2:
+                # Calculate correlations for two consecutive windows
+                symbol_returns1 = symbol_prices.pct_change().dropna()[-window*2:-window]
+                dxy_returns1 = dxy_prices.pct_change().dropna()[-window*2:-window]
+                
+                symbol_returns2 = symbol_prices.pct_change().dropna()[-window:]
+                dxy_returns2 = dxy_prices.pct_change().dropna()[-window:]
+                
+                # Calculate correlations for each window
+                if self.config.correlation_method == 'pearson':
+                    corr1, _ = pearsonr(dxy_returns1, symbol_returns1)
+                    corr2, _ = pearsonr(dxy_returns2, symbol_returns2)
+                else:
+                    corr1, _ = spearmanr(dxy_returns1, symbol_returns1)
+                    corr2, _ = spearmanr(dxy_returns2, symbol_returns2)
+                
+                # Calculate stability score (1 - absolute difference)
+                stability = 1 - abs(corr1 - corr2)
+                correlation_stability_scores.append(stability)
+        
+        # Calculate trend strength from price action
+        trend_strength = await self._calculate_trend_strength(symbol_prices)
+        
+        # Calculate correlation strength score (absolute value of correlation)
+        correlation_strength_score = abs(correlation)
+        
+        # Combine scores with weights
+        if correlation_stability_scores:
+            avg_stability = np.mean(correlation_stability_scores)
+            trend_confidence = (
+                correlation_strength_score * 0.4 +
+                avg_stability * 0.3 +
+                trend_strength * 0.3
+            )
+        else:
+            # Fallback to basic calculation if not enough data for rolling windows
+            trend_confidence = correlation_strength_score * 0.7 + trend_strength * 0.3
+        
+        # Ensure trend confidence is within valid range
+        trend_confidence = np.clip(trend_confidence, 0.0, 1.0)
+        
+        logger.debug(f"{symbol} trend confidence: {trend_confidence:.3f} (strength: {correlation_strength_score:.3f}, stability: {np.mean(correlation_stability_scores):.3f}, trend: {trend_strength:.3f})")
+        
+        return trend_confidence
+    
+    async def _calculate_trend_strength(self, prices: pd.Series) -> float:
+        """Calculate trend strength from price series"""
+        if len(prices) < 20:
+            return 0.5  # Neutral trend
+        
+        # Use multiple trend indicators
+        returns = prices.pct_change().dropna()
+        
+        # 1. Linear regression slope (trend direction and strength)
+        x = np.arange(len(prices[-20:]))
+        y = prices[-20:].values
+        slope, _, r_value, _, _ = np.polyfit(x, y, 1)
+        regression_strength = abs(r_value)
+        
+        # 2. Moving average convergence (trend persistence)
+        short_ma = prices.rolling(window=10).mean().iloc[-1]
+        long_ma = prices.rolling(window=30).mean().iloc[-1]
+        ma_strength = abs(short_ma - long_ma) / prices.iloc[-1]
+        
+        # 3. Volatility in direction of trend
+        trend_direction = 1 if slope > 0 else -1
+        directional_volatility = np.std(returns[-20:][returns[-20:] * trend_direction > 0])
+        
+        # Combine indicators
+        trend_strength = (
+            regression_strength * 0.5 +
+            ma_strength * 0.3 +
+            directional_volatility * 0.2
+        )
+        
+        return np.clip(trend_strength, 0.0, 1.0)
     
     async def _detect_dxy_trend(self) -> str:
-        """Detect DXY trend direction"""
+        """Detect DXY trend direction with improved accuracy using multiple indicators"""
         if len(self.dxy_price_history) < 20:
             return 'neutral'
             
-        # Use simple moving average to determine trend
         prices = self.dxy_price_history.values
+        
+        # 1. Moving average crossover
         short_ma = np.mean(prices[-10:])
         long_ma = np.mean(prices[-30:])
         
+        # 2. Price direction over different time frames
+        price_change_10d = (prices[-1] - prices[-10]) / prices[-10]
+        price_change_20d = (prices[-1] - prices[-20]) / prices[-20]
+        price_change_30d = (prices[-1] - prices[-30]) / prices[-30]
+        
+        # 3. Momentum indicator (RSI)
+        returns = np.diff(np.log(prices[-14:]))
+        gains = returns[returns > 0].sum()
+        losses = -returns[returns < 0].sum()
+        rs = gains / losses if losses > 0 else 100
+        rsi = 100 - (100 / (1 + rs))
+        
+        # Combine trend signals with voting system
+        bullish_signals = 0
+        bearish_signals = 0
+        
+        # MA crossover signal
         if short_ma > long_ma * (1 + self.config.trend_strength_threshold):
-            return 'bullish'
+            bullish_signals += 2
         elif short_ma < long_ma * (1 - self.config.trend_strength_threshold):
-            return 'bearish'
-        else:
-            return 'neutral'
+            bearish_signals += 2
+            
+        # Price direction signals
+        if price_change_10d > 0.005:
+            bullish_signals += 1
+        elif price_change_10d < -0.005:
+            bearish_signals += 1
+            
+        if price_change_20d > 0.01:
+            bullish_signals += 1
+        elif price_change_20d < -0.01:
+            bearish_signals += 1
+            
+        if price_change_30d > 0.015:
+            bullish_signals += 1
+        elif price_change_30d < -0.015:
+            bearish_signals += 1
+            
+        # RSI signal
+        if rsi > 60:
+            bearish_signals += 1  # Overbought
+        elif rsi < 40:
+            bullish_signals += 1  # Oversold
+            
+        # Determine trend based on signal strength
+        total_signals = bullish_signals + bearish_signals
+        
+        if total_signals >= 3:
+            if bullish_signals > bearish_signals + 1:
+                return 'bullish'
+            elif bearish_signals > bullish_signals + 1:
+                return 'bearish'
+                
+        return 'neutral'
     
     async def _calculate_dxy_momentum(self) -> float:
         """Calculate DXY momentum"""

@@ -45,6 +45,7 @@ class SignalType(Enum):
     KILL_ZONE = "kill_zone"
     MULTI_TIMEFRAME = "multi_timeframe"
     REGIME_SHIFT = "regime_shift"
+    FIBONACCI = "fibonacci"
 
 
 @dataclass
@@ -110,6 +111,9 @@ class StrategyEngine:
         self.config = config
         self.logger = logging.getLogger(__name__)
         
+        # Validate strategy parameters
+        self._validate_parameters()
+        
         # Initialize components
         self.liquidity_engine = LiquidityEngine(config)
         self.session_engine = SessionEngine(config)
@@ -148,64 +152,88 @@ class StrategyEngine:
         
         logger.info("StrategyEngine initialized with regime detection")
     
+    def _validate_parameters(self):
+        """Validate strategy configuration parameters"""
+        # Validate SMC parameters
+        smc_config = self.config['strategy']['smc']
+        if not isinstance(smc_config['swing_length'], int) or smc_config['swing_length'] < 2 or smc_config['swing_length'] > 50:
+            raise ValueError(f"Invalid swing_length: {smc_config['swing_length']} (must be between 2 and 50)")
+        if not isinstance(smc_config['fvg_min_size'], (int, float)) or smc_config['fvg_min_size'] <= 0 or smc_config['fvg_min_size'] > 100:
+            raise ValueError(f"Invalid fvg_min_size: {smc_config['fvg_min_size']} (must be positive and <= 100)")
+        if not isinstance(smc_config['liquidity_lookback'], int) or smc_config['liquidity_lookback'] < 5 or smc_config['liquidity_lookback'] > 200:
+            raise ValueError(f"Invalid liquidity_lookback: {smc_config['liquidity_lookback']} (must be between 5 and 200)")
+        
+        # Validate regime detection parameters
+        regime_config = self.config['strategy']['regime_detection']
+        if not isinstance(regime_config['enabled'], bool):
+            raise ValueError(f"Invalid regime detection enabled: {regime_config['enabled']} (must be boolean)")
+        if regime_config['method'] not in ['hmm', 'clustering', 'volatility_based', 'rule_based']:
+            raise ValueError(f"Invalid regime detection method: {regime_config['method']} (must be hmm, clustering, volatility_based, or rule_based)")
+        if not isinstance(regime_config['lookback_periods'], int) or regime_config['lookback_periods'] < 10 or regime_config['lookback_periods'] > 500:
+            raise ValueError(f"Invalid regime lookback: {regime_config['lookback_periods']} (must be between 10 and 500)")
+        if not isinstance(regime_config['update_frequency'], int) or regime_config['update_frequency'] < 1 or regime_config['update_frequency'] > 100:
+            raise ValueError(f"Invalid regime update frequency: {regime_config['update_frequency']} (must be between 1 and 100)")
+        
+        logger.info("Strategy parameters validated successfully")
+    
     def _init_regime_params(self) -> Dict[MarketRegime, Dict]:
         """Initialize regime-specific trading parameters"""
         return {
             MarketRegime.TRENDING_BULLISH: {
-                'min_confidence': 0.65,
+                'min_confidence': 0.70,
                 'position_multiplier': 1.2,
                 'stop_loss_multiplier': 1.0,
                 'take_profit_multiplier': 1.5,
                 'max_trades': 5,
-                'preferred_strategies': ['bos_breakout', 'order_block_bounce']
+                'preferred_strategies': ['order_block_bounce', 'liquidity_sweep', 'fvg_entry']
             },
             MarketRegime.TRENDING_BEARISH: {
-                'min_confidence': 0.65,
+                'min_confidence': 0.70,
                 'position_multiplier': 1.2,
                 'stop_loss_multiplier': 1.0,
                 'take_profit_multiplier': 1.5,
                 'max_trades': 5,
-                'preferred_strategies': ['bos_breakout', 'order_block_bounce']
+                'preferred_strategies': ['order_block_bounce', 'liquidity_sweep', 'fvg_entry']
             },
             MarketRegime.RANGING: {
-                'min_confidence': 0.70,
+                'min_confidence': 0.75,
                 'position_multiplier': 0.8,
                 'stop_loss_multiplier': 0.8,
                 'take_profit_multiplier': 1.2,
                 'max_trades': 3,
-                'preferred_strategies': ['fvg_entry', 'liquidity_sweep']
+                'preferred_strategies': ['liquidity_sweep', 'fvg_entry', 'order_block_bounce']
             },
             MarketRegime.VOLATILE: {
-                'min_confidence': 0.75,
+                'min_confidence': 0.80,
                 'position_multiplier': 0.6,
                 'stop_loss_multiplier': 1.5,
                 'take_profit_multiplier': 2.0,
                 'max_trades': 2,
-                'preferred_strategies': ['contrarian', 'kill_zone']
+                'preferred_strategies': ['liquidity_sweep', 'order_block_bounce', 'fvg_entry']
             },
             MarketRegime.QUIET: {
-                'min_confidence': 0.80,
+                'min_confidence': 0.85,
                 'position_multiplier': 0.5,
                 'stop_loss_multiplier': 0.7,
                 'take_profit_multiplier': 1.0,
                 'max_trades': 1,
-                'preferred_strategies': ['multi_timeframe']
+                'preferred_strategies': ['order_block_bounce', 'fvg_entry']
             },
             MarketRegime.BREAKOUT: {
-                'min_confidence': 0.60,
+                'min_confidence': 0.65,
                 'position_multiplier': 1.5,
                 'stop_loss_multiplier': 1.2,
                 'take_profit_multiplier': 2.0,
                 'max_trades': 4,
-                'preferred_strategies': ['bos_breakout', 'liquidity_sweep']
+                'preferred_strategies': ['liquidity_sweep', 'order_block_bounce', 'fvg_entry']
             },
             MarketRegime.REVERSAL: {
-                'min_confidence': 0.70,
+                'min_confidence': 0.75,
                 'position_multiplier': 1.0,
                 'stop_loss_multiplier': 1.1,
                 'take_profit_multiplier': 1.8,
                 'max_trades': 3,
-                'preferred_strategies': ['choch_reversal', 'contrarian']
+                'preferred_strategies': ['order_block_bounce', 'liquidity_sweep', 'fvg_entry']
             }
         }
     
@@ -522,15 +550,141 @@ class StrategyEngine:
     def get_regime_parameters(self, regime: MarketRegime) -> Dict:
         """Get trading parameters for current regime"""
         return self.regime_params.get(regime, self.regime_params[MarketRegime.RANGING])
-    
-    async def generate_trading_signals(self, df: pd.DataFrame, symbol: str = "default") -> List[TradingSignal]:
+        
+    def _check_multi_timeframe_confluence(self, signals: List[TradingSignal], tf_data: Dict) -> List[TradingSignal]:
         """
-        Generate trading signals with regime awareness
+        Check if signals have multi-timeframe confluence
         
         Args:
-            df: OHLCV DataFrame
-            symbol: Trading symbol
+            signals: List of trading signals to check
+            tf_data: Dictionary of lower timeframe data
+            
+        Returns:
+            List of signals with multi-timeframe confluence
+        """
+        if not tf_data:
+            return signals
+            
+        confirmed_signals = []
         
+        for signal in signals:
+            has_confluence = True
+            
+            # Check lower timeframes for confirmation
+            for tf, tf_df in tf_data.items():
+                # Find the corresponding candle in lower timeframe
+                tf_signal = self._find_corresponding_tf_signal(signal, tf_df, tf)
+                if not tf_signal:
+                    has_confluence = False
+                    break
+                    
+                # Check if lower timeframe signal confirms
+                if not self._confirm_signal_on_lower_tf(signal, tf_signal, tf_df, tf):
+                    has_confluence = False
+                    break
+                    
+            if has_confluence:
+                # Increase confidence for multi-timeframe confirmation
+                signal.confidence = min(signal.confidence + 0.15, 1.0)
+                signal.confluences.append('multi_timeframe')
+                confirmed_signals.append(signal)
+                
+        return confirmed_signals
+        
+    def _find_corresponding_tf_signal(self, signal: TradingSignal, tf_df: pd.DataFrame, timeframe: str) -> Optional[TradingSignal]:
+        """
+        Find corresponding signal in lower timeframe
+        
+        Args:
+            signal: Primary timeframe signal
+            tf_df: Lower timeframe DataFrame
+            timeframe: Timeframe string
+            
+        Returns:
+            Corresponding lower timeframe signal or None
+        """
+        try:
+            # Find the candle in lower timeframe that contains the primary signal time
+            tf_candle = tf_df[tf_df.index <= signal.timestamp].iloc[-1:]
+            if tf_candle.empty:
+                return None
+                
+            # Perform quick analysis on lower timeframe
+            liquidity_analysis = self.liquidity_engine.analyze_market(tf_df)
+            
+            # Check for signals in lower timeframe
+            tf_signals = []
+            
+            # Check for liquidity sweeps
+            liquidity_signals = self._generate_liquidity_signals(tf_df, liquidity_analysis, signal.regime, signal.symbol)
+            tf_signals.extend(liquidity_signals)
+            
+            # Check for FVG entries
+            fvg_signals = self._generate_fvg_signals(tf_df, liquidity_analysis, signal.regime, signal.symbol)
+            tf_signals.extend(fvg_signals)
+            
+            # Check for order block bounces
+            ob_signals = self._generate_order_block_signals(tf_df, liquidity_analysis, signal.regime, signal.symbol)
+            tf_signals.extend(ob_signals)
+            
+            return tf_signals[0] if tf_signals else None
+            
+        except Exception as e:
+            logger.warning(f"Failed to find corresponding signal for {timeframe} timeframe: {e}")
+            return None
+            
+    def _confirm_signal_on_lower_tf(self, primary_signal: TradingSignal, tf_signal: TradingSignal, 
+                                   tf_df: pd.DataFrame, timeframe: str) -> bool:
+        """
+        Check if lower timeframe signal confirms primary signal
+        
+        Args:
+            primary_signal: Primary timeframe signal
+            tf_signal: Lower timeframe signal
+            tf_df: Lower timeframe DataFrame
+            timeframe: Timeframe string
+            
+        Returns:
+            True if lower timeframe confirms, False otherwise
+        """
+        # Direction must match
+        if primary_signal.direction != tf_signal.direction:
+            return False
+            
+        # Check if lower timeframe has supporting structure
+        liquidity_analysis = self.liquidity_engine.analyze_market(tf_df)
+        
+        # For bullish signals, check for bullish structure
+        if primary_signal.direction == 'long':
+            # Check if lower timeframe has bullish order blocks or FVG
+            bullish_ob = any(ob.direction == 'bullish' and not ob.mitigated 
+                          for ob in liquidity_analysis['order_blocks'])
+            bullish_fvg = any(fvg.type == 'bullish' and not fvg.mitigated 
+                           for fvg in liquidity_analysis['fvg_zones'])
+            
+            return bullish_ob or bullish_fvg
+            
+        # For bearish signals, check for bearish structure
+        elif primary_signal.direction == 'short':
+            # Check if lower timeframe has bearish order blocks or FVG
+            bearish_ob = any(ob.direction == 'bearish' and not ob.mitigated 
+                           for ob in liquidity_analysis['order_blocks'])
+            bearish_fvg = any(fvg.type == 'bearish' and not fvg.mitigated 
+                           for fvg in liquidity_analysis['fvg_zones'])
+            
+            return bearish_ob or bearish_fvg
+            
+        return False
+    
+    async def generate_trading_signals(self, df: pd.DataFrame, symbol: str = "default", tf_data: Optional[Dict] = None) -> List[TradingSignal]:
+        """
+        Generate trading signals with regime awareness and multi-timeframe confirmation
+        
+        Args:
+            df: OHLCV DataFrame (primary timeframe, e.g., 4H)
+            symbol: Trading symbol
+            tf_data: Optional dictionary of lower timeframe data (e.g., {'15M': df_15m})
+            
         Returns:
             List of trading signals
         """
@@ -546,26 +700,39 @@ class StrategyEngine:
         # Get session info
         session_type, session_config = self.session_engine.get_current_session()
         
+        # Determine current trend from liquidity analysis
+        current_trend = liquidity_analysis['structure']['current_trend']
+        
         signals = []
         
         # Generate signals from each strategy type
         for strategy in regime_params['preferred_strategies']:
             if strategy == 'bos_breakout':
-                new_signals = self._generate_bos_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_bos_signals(df, liquidity_analysis, regime, symbol)
             elif strategy == 'choch_reversal':
-                new_signals = self._generate_choch_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_choch_signals(df, liquidity_analysis, regime, symbol)
             elif strategy == 'liquidity_sweep':
-                new_signals = self._generate_liquidity_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_liquidity_signals(df, liquidity_analysis, regime, symbol)
             elif strategy == 'fvg_entry':
-                new_signals = self._generate_fvg_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_fvg_signals(df, liquidity_analysis, regime, symbol)
             elif strategy == 'order_block_bounce':
-                new_signals = self._generate_order_block_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_order_block_signals(df, liquidity_analysis, regime, symbol)
             elif strategy == 'contrarian':
-                new_signals = self._generate_contrarian_signals(df, liquidity_analysis, regime)
+                new_signals = self._generate_contrarian_signals(df, liquidity_analysis, regime, symbol)
+            elif strategy == 'fibonacci':
+                new_signals = self._generate_fibonacci_signals(df, liquidity_analysis, regime, symbol)
             else:
                 continue
             
-            signals.extend(new_signals)
+            # Filter signals to only trade with the trend
+            filtered_signals = []
+            for signal in new_signals:
+                if current_trend == 'bullish' and signal.direction == 'long':
+                    filtered_signals.append(signal)
+                elif current_trend == 'bearish' and signal.direction == 'short':
+                    filtered_signals.append(signal)
+            
+            signals.extend(filtered_signals)
         
         # Apply regime-based filters and adjustments
         filtered_signals = self._apply_regime_filters(signals, regime, regime_params)
@@ -610,33 +777,51 @@ class StrategyEngine:
             kill_zones = self.session_engine.get_active_kill_zones()
             signal.kill_zone = any(kz.session_type == session_type for kz in kill_zones)
         
+        # Apply multi-timeframe confirmation if lower timeframe data available
+        if tf_data:
+            filtered_signals = self._check_multi_timeframe_confluence(filtered_signals, tf_data)
+            logger.debug(f"Multi-timeframe filter removed {len(signals) - len(filtered_signals)} signals")
+        
         logger.info(f"Generated {len(filtered_signals)} signals for {symbol} in {regime.value} regime")
         
         return filtered_signals
     
     def _apply_regime_filters(self, signals: List[TradingSignal], regime: MarketRegime,
-                             regime_params: Dict) -> List[TradingSignal]:
+                              regime_params: Dict) -> List[TradingSignal]:
         """Apply regime-specific filters to signals"""
         filtered = []
         
+        # Get global confidence configuration
+        confidence_config = self.config.get('strategy', {}).get('signal_confidence', {})
+        enabled = confidence_config.get('enabled', True)
+        min_confidence = confidence_config.get('min_confidence', 0.75)
+        
         for signal in signals:
-            # Apply confidence threshold
-            if signal.confidence < regime_params['min_confidence']:
+            # Apply global confidence threshold if enabled
+            if enabled and signal.confidence < min_confidence:
+                logger.debug(f"Signal filtered - low confidence: {signal.confidence:.2f} < {min_confidence:.2f}")
                 continue
-            
+                
+            # Apply regime-specific confidence threshold
+            if signal.confidence < regime_params['min_confidence']:
+                logger.debug(f"Signal filtered - low regime confidence: {signal.confidence:.2f} < {regime_params['min_confidence']:.2f}")
+                continue
+                
             # Apply regime-specific strategy preferences
             if signal.signal_type.value not in regime_params['preferred_strategies']:
+                logger.debug(f"Signal filtered - strategy not preferred: {signal.signal_type.value}")
                 continue
-            
+                
             # Adjust position size based on regime
             signal.metadata['position_multiplier'] = regime_params['position_multiplier']
             
             filtered.append(signal)
         
+        logger.debug(f"Applied regime filters: {len(signals)} -> {len(filtered)} signals")
         return filtered
     
     def _generate_bos_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                              regime: MarketRegime) -> List[TradingSignal]:
+                              regime: MarketRegime, symbol: str) -> List[TradingSignal]:
         """Generate Break of Structure signals"""
         signals = []
         
@@ -650,7 +835,7 @@ class StrategyEngine:
         if swing_highs and current_price > swing_highs[-1]['price']:
             signal = TradingSignal(
                 timestamp=df.index[-1],
-                symbol='default',
+                symbol=symbol,
                 direction='long',
                 signal_type=SignalType.BOS_BREAKOUT,
                 entry_price=current_price,
@@ -668,7 +853,7 @@ class StrategyEngine:
         if swing_lows and current_price < swing_lows[-1]['price']:
             signal = TradingSignal(
                 timestamp=df.index[-1],
-                symbol='default',
+                symbol=symbol,
                 direction='short',
                 signal_type=SignalType.BOS_BREAKOUT,
                 entry_price=current_price,
@@ -685,7 +870,7 @@ class StrategyEngine:
         return signals
     
     def _generate_choch_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                                regime: MarketRegime) -> List[TradingSignal]:
+                                regime: MarketRegime, symbol: str) -> List[TradingSignal]:
         """Generate Change of Character signals"""
         signals = []
         
@@ -700,7 +885,7 @@ class StrategyEngine:
                 
                 signal = TradingSignal(
                     timestamp=df.index[-1],
-                    symbol='default',
+                    symbol=symbol,
                     direction='long',
                     signal_type=SignalType.CHOCH_REVERSAL,
                     entry_price=df['close'].iloc[-1],
@@ -720,7 +905,7 @@ class StrategyEngine:
                 
                 signal = TradingSignal(
                     timestamp=df.index[-1],
-                    symbol='default',
+                    symbol=symbol,
                     direction='short',
                     signal_type=SignalType.CHOCH_REVERSAL,
                     entry_price=df['close'].iloc[-1],
@@ -737,7 +922,7 @@ class StrategyEngine:
         return signals
     
     def _generate_liquidity_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                                    regime: MarketRegime) -> List[TradingSignal]:
+                                    regime: MarketRegime, symbol: str) -> List[TradingSignal]:
         """Generate Liquidity Sweep signals"""
         signals = []
         
@@ -749,7 +934,7 @@ class StrategyEngine:
             if zone.is_swept and abs(current_price - zone.price_level) / zone.price_level < 0.001:
                 signal = TradingSignal(
                     timestamp=df.index[-1],
-                    symbol='default',
+                    symbol=symbol,
                     direction='short',  # Sell after sweeping buy-side liquidity
                     signal_type=SignalType.LIQUIDITY_SWEEP,
                     entry_price=current_price,
@@ -769,7 +954,7 @@ class StrategyEngine:
             if zone.is_swept and abs(current_price - zone.price_level) / zone.price_level < 0.001:
                 signal = TradingSignal(
                     timestamp=df.index[-1],
-                    symbol='default',
+                    symbol=symbol,
                     direction='long',  # Buy after sweeping sell-side liquidity
                     signal_type=SignalType.LIQUIDITY_SWEEP,
                     entry_price=current_price,
@@ -787,7 +972,7 @@ class StrategyEngine:
         return signals
     
     def _generate_fvg_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                              regime: MarketRegime) -> List[TradingSignal]:
+                               regime: MarketRegime, symbol: str) -> List[TradingSignal]:
         """Generate Fair Value Gap signals"""
         signals = []
         
@@ -801,7 +986,7 @@ class StrategyEngine:
                     if fvg.type == 'bullish' and fvg.ote_zone_62 <= current_price <= fvg.ote_zone_79:
                         signal = TradingSignal(
                             timestamp=df.index[-1],
-                            symbol='default',
+                             symbol=symbol,
                             direction='long',
                             signal_type=SignalType.FVG_ENTRY,
                             entry_price=current_price,
@@ -819,7 +1004,7 @@ class StrategyEngine:
                     elif fvg.type == 'bearish' and fvg.ote_zone_79 <= current_price <= fvg.ote_zone_62:
                         signal = TradingSignal(
                             timestamp=df.index[-1],
-                            symbol='default',
+                             symbol=symbol,
                             direction='short',
                             signal_type=SignalType.FVG_ENTRY,
                             entry_price=current_price,
@@ -836,8 +1021,96 @@ class StrategyEngine:
         
         return signals
     
+    def _generate_fibonacci_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
+                                      regime: MarketRegime, symbol: str) -> List[TradingSignal]:
+        """Generate Fibonacci-based trading signals"""
+        signals = []
+        
+        # Find swing points for Fibonacci analysis
+        swing_highs = liquidity_analysis['structure']['swing_highs']
+        swing_lows = liquidity_analysis['structure']['swing_lows']
+        
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return signals
+            
+        # Get recent swing points
+        recent_high = swing_highs[-1]['price']
+        recent_low = swing_lows[-1]['price']
+        
+        # Calculate Fibonacci levels based on recent swing
+        fib_calc = self.indicators.calculate_fibonacci_levels(recent_high, recent_low)
+        current_price = df['close'].iloc[-1]
+        
+        # Only generate signals if there's a significant swing (at least 1% move)
+        swing_size = abs(recent_high - recent_low) / recent_low
+        if swing_size < 0.01:
+            return signals
+            
+        # Check for Fibonacci retracement bounce (bullish)
+        if current_price > recent_low and current_price < recent_high:
+            # Check 61.8% retracement (strong support)
+            if abs(current_price - fib_calc['retracement']['0.618']) / current_price < 0.002:
+                signal = TradingSignal(
+                    timestamp=df.index[-1],
+                    symbol=symbol,
+                    direction='long',
+                    signal_type=SignalType.FIBONACCI,
+                    entry_price=current_price,
+                    stop_loss=recent_low * 0.998,
+                    take_profit=fib_calc['extension']['1.272'],  # Use 1.272 extension instead of recent high
+                    risk_reward=self._calculate_risk_reward(current_price, fib_calc['extension']['1.272'], recent_low * 0.998),
+                    confidence=0.85,
+                    regime=regime,
+                    regime_confidence=0.8,
+                    confluences=['fibonacci_retracement', '61.8_level'],
+                    metadata={'fibonacci_level': '0.618', 'swing_high': recent_high, 'swing_low': recent_low}
+                )
+                signals.append(signal)
+            
+            # Check 50% retracement
+            if abs(current_price - fib_calc['retracement']['0.5']) / current_price < 0.002:
+                signal = TradingSignal(
+                    timestamp=df.index[-1],
+                    symbol=symbol,
+                    direction='long',
+                    signal_type=SignalType.FIBONACCI,
+                    entry_price=current_price,
+                    stop_loss=recent_low * 0.998,
+                    take_profit=fib_calc['extension']['1.272'],
+                    risk_reward=self._calculate_risk_reward(current_price, fib_calc['extension']['1.272'], recent_low * 0.998),
+                    confidence=0.75,
+                    regime=regime,
+                    regime_confidence=0.8,
+                    confluences=['fibonacci_retracement', '50_level'],
+                    metadata={'fibonacci_level': '0.5', 'swing_high': recent_high, 'swing_low': recent_low}
+                )
+                signals.append(signal)
+        
+        # Check for Fibonacci retracement resistance (bearish)
+        if current_price < recent_high and current_price > recent_low:
+            # Check 61.8% retracement (strong resistance)
+            if abs(current_price - fib_calc['retracement']['0.382']) / current_price < 0.002:
+                signal = TradingSignal(
+                    timestamp=df.index[-1],
+                    symbol=symbol,
+                    direction='short',
+                    signal_type=SignalType.FIBONACCI,
+                    entry_price=current_price,
+                    stop_loss=recent_high * 1.002,
+                    take_profit=fib_calc['extension']['1.272'],
+                    risk_reward=self._calculate_risk_reward(current_price, fib_calc['extension']['1.272'], recent_high * 1.002),
+                    confidence=0.85,
+                    regime=regime,
+                    regime_confidence=0.8,
+                    confluences=['fibonacci_retracement', '38.2_level'],
+                    metadata={'fibonacci_level': '0.382', 'swing_high': recent_high, 'swing_low': recent_low}
+                )
+                signals.append(signal)
+        
+        return signals
+    
     def _generate_order_block_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                                      regime: MarketRegime) -> List[TradingSignal]:
+                                      regime: MarketRegime, symbol: str) -> List[TradingSignal]:
         """Generate Order Block signals"""
         signals = []
         
@@ -850,7 +1123,7 @@ class StrategyEngine:
                 if ob.direction == 'bullish' and abs(current_price - ob.mitigation_price) / ob.mitigation_price < 0.001:
                     signal = TradingSignal(
                         timestamp=df.index[-1],
-                        symbol='default',
+                             symbol=symbol,
                         direction='long',
                         signal_type=SignalType.ORDER_BLOCK_BOUNCE,
                         entry_price=current_price,
@@ -868,7 +1141,7 @@ class StrategyEngine:
                 elif ob.direction == 'bearish' and abs(current_price - ob.mitigation_price) / ob.mitigation_price < 0.001:
                     signal = TradingSignal(
                         timestamp=df.index[-1],
-                        symbol='default',
+                             symbol=symbol,
                         direction='short',
                         signal_type=SignalType.ORDER_BLOCK_BOUNCE,
                         entry_price=current_price,
@@ -885,30 +1158,231 @@ class StrategyEngine:
         
         return signals
     
-    def _generate_contrarian_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
-                                     regime: MarketRegime) -> List[TradingSignal]:
-        """Generate Contrarian signals"""
+    def _generate_enhanced_bearish_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
+                                           regime: MarketRegime, symbol: str) -> List[TradingSignal]:
+        """Generate Enhanced Bearish Strategy signals based on market structure"""
         signals = []
         
-        contrarian = liquidity_analysis.get('contrarian', [])
+        # Enhanced bearish strategy based on market conditions rather than hardcoded dates
+        current_price = df['close'].iloc[-1]
+        current_time = df.index[-1]
         
-        for signal_data in contrarian:
-            # Convert contrarian signal to TradingSignal
+        # Check for specific market conditions that indicate bearish opportunities
+        # (This replaces the hardcoded date-based approach)
+        
+        # Conditions for enhanced bearish strategy:
+        # 1. Market in strong bearish regime
+        # 2. Liquidity sweeps detected
+        # 3. Order blocks identified
+        # 4. Key levels broken
+        if regime == MarketRegime.TRENDING_BEARISH and \
+           liquidity_analysis.get('liquidity_sweeps', False) and \
+           liquidity_analysis.get('order_blocks', False):
+            
+            # Calculate dynamic entry, stop loss, and take profit based on market structure
+            recent_high = liquidity_analysis['recent_high']
+            recent_low = liquidity_analysis['recent_low']
+            
+            # Entry: Near recent high
+            if abs(current_price - recent_high) / recent_high < 0.005:
+                stop_loss = recent_high * 1.002
+                target_risk_reward = 3.0
+                
+                # Calculate risk and take profit
+                risk = current_price - stop_loss
+                take_profit = current_price + (risk * target_risk_reward)
+                
+                signal = TradingSignal(
+                    timestamp=current_time,
+                    symbol=symbol,
+                    direction='short',
+                    signal_type=SignalType.CONTRARIAN,
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    risk_reward=target_risk_reward,
+                    confidence=0.85,
+                    regime=regime,
+                    regime_confidence=0.9,
+                    confluences=['enhanced_bearish', '1:3_rr'],
+                    contrarian=True,
+                    metadata={
+                        'trailing_stop': {
+                            'activate_threshold': 0.03,  # Activate after 3% drop from entry
+                            'trailing_percent': 0.02  # Trail by 2%
+                        },
+                        'scaling': {
+                            'initial_position': 0.5,  # 50% initial position
+                            'scale_in_price': recent_high * 1.001,  # Scale in if price rises further
+                            'scale_in_position': 0.5  # 50% additional position
+                        },
+                        'multi_tier_exit': [
+                            {'level': take_profit, 'percentage': 0.5, 'reason': '1:3_risk_reward'},
+                            {'level': take_profit * 1.1, 'percentage': 0.5, 'reason': 'extended_target'}
+                        ]
+                    }
+                )
+                
+                signals.append(signal)
+        
+        return signals
+
+    def _generate_contrarian_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
+                                      regime: MarketRegime, symbol: str) -> List[TradingSignal]:
+        """Generate Contrarian signals with strict risk management"""
+        signals = []
+        
+        # First, try enhanced bearish strategy
+        enhanced_signals = self._generate_enhanced_bearish_signals(df, liquidity_analysis, regime, symbol)
+        if enhanced_signals:
+            signals.extend(enhanced_signals)
+        
+        # Then try enhanced bullish strategy
+        bullish_signals = self._generate_enhanced_bullish_signals(df, liquidity_analysis, regime, symbol)
+        if bullish_signals:
+            signals.extend(bullish_signals)
+        
+        # Finally, check for general contrarian opportunities based on overbought/oversold conditions
+        if not signals:
+            general_signals = self._generate_general_contrarian_signals(df, liquidity_analysis, regime, symbol)
+            if general_signals:
+                signals.extend(general_signals)
+        
+        return signals
+    
+    def _generate_enhanced_bullish_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
+                                           regime: MarketRegime, symbol: str) -> List[TradingSignal]:
+        """Generate Enhanced Bullish Strategy signals based on market structure"""
+        signals = []
+        
+        # Enhanced bullish strategy based on market conditions rather than hardcoded dates
+        current_price = df['close'].iloc[-1]
+        current_time = df.index[-1]
+        
+        # Conditions for enhanced bullish strategy:
+        # 1. Market in strong bullish regime
+        # 2. Liquidity sweeps detected
+        # 3. Order blocks identified
+        # 4. Key levels broken
+        if regime == MarketRegime.TRENDING_BULLISH and \
+           liquidity_analysis.get('liquidity_sweeps', False) and \
+           liquidity_analysis.get('order_blocks', False):
+            
+            # Calculate dynamic entry, stop loss, and take profit based on market structure
+            recent_high = liquidity_analysis['recent_high']
+            recent_low = liquidity_analysis['recent_low']
+            
+            # Entry: Near recent low
+            if abs(current_price - recent_low) / recent_low < 0.005:
+                stop_loss = recent_low * 0.998
+                target_risk_reward = 3.0
+                
+                # Calculate risk and take profit
+                risk = stop_loss - current_price
+                take_profit = current_price - (risk * target_risk_reward)
+                
+                signal = TradingSignal(
+                    timestamp=current_time,
+                    symbol=symbol,
+                    direction='long',
+                    signal_type=SignalType.CONTRARIAN,
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    risk_reward=target_risk_reward,
+                    confidence=0.85,
+                    regime=regime,
+                    regime_confidence=0.9,
+                    confluences=['enhanced_bullish', '1:3_rr'],
+                    contrarian=True,
+                    metadata={
+                        'trailing_stop': {
+                            'activate_threshold': 0.03,  # Activate after 3% rise from entry
+                            'trailing_percent': 0.02  # Trail by 2%
+                        },
+                        'scaling': {
+                            'initial_position': 0.5,  # 50% initial position
+                            'scale_in_price': recent_low * 0.999,  # Scale in if price drops further
+                            'scale_in_position': 0.5  # 50% additional position
+                        },
+                        'multi_tier_exit': [
+                            {'level': take_profit, 'percentage': 0.5, 'reason': '1:3_risk_reward'},
+                            {'level': take_profit * 1.1, 'percentage': 0.5, 'reason': 'extended_target'}
+                        ]
+                    }
+                )
+                
+                signals.append(signal)
+        
+        return signals
+    
+    def _generate_general_contrarian_signals(self, df: pd.DataFrame, liquidity_analysis: Dict,
+                                             regime: MarketRegime, symbol: str) -> List[TradingSignal]:
+        """Generate general contrarian signals based on overbought/oversold conditions"""
+        signals = []
+        
+        current_price = df['close'].iloc[-1]
+        current_time = df.index[-1]
+        
+        # Calculate RSI for overbought/oversold conditions
+        rsi = self._calculate_rsi(df['close'].values, 14)[-1]
+        
+        # Overbought condition - bearish signal
+        if rsi > 70:
+            # Find recent support as stop loss
+            recent_low = df['low'].rolling(20).min().iloc[-1]
+            stop_loss = recent_low * 0.995
+            target_risk_reward = 2.0
+            
+            # Calculate take profit
+            risk = current_price - stop_loss
+            take_profit = current_price + (risk * target_risk_reward)
+            
             signal = TradingSignal(
-                timestamp=df.index[-1],
-                symbol='default',
-                direction=signal_data.direction,
+                timestamp=current_time,
+                symbol=symbol,
+                direction='bearish',
                 signal_type=SignalType.CONTRARIAN,
-                entry_price=signal_data.entry_zone[0],
-                stop_loss=signal_data.stop_loss,
-                take_profit=signal_data.take_profit,
-                risk_reward=signal_data.risk_reward,
-                confidence=signal_data.confidence,
+                entry_price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                risk_reward=target_risk_reward,
+                confidence=0.7,
                 regime=regime,
                 regime_confidence=0.8,
-                confluences=signal_data.structure_confluence,
+                confluences=['rsi_overbought'],
                 contrarian=True
             )
+            
+            signals.append(signal)
+        
+        # Oversold condition - bullish signal
+        if rsi < 30:
+            # Find recent resistance as stop loss
+            recent_high = df['high'].rolling(20).max().iloc[-1]
+            stop_loss = recent_high * 1.005
+            target_risk_reward = 2.0
+            
+            # Calculate take profit
+            risk = stop_loss - current_price
+            take_profit = current_price - (risk * target_risk_reward)
+            
+            signal = TradingSignal(
+                timestamp=current_time,
+                symbol=symbol,
+                direction='bullish',
+                signal_type=SignalType.CONTRARIAN,
+                entry_price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                risk_reward=target_risk_reward,
+                confidence=0.7,
+                regime=regime,
+                regime_confidence=0.8,
+                confluences=['rsi_oversold'],
+                contrarian=True
+            )
+            
             signals.append(signal)
         
         return signals

@@ -9,19 +9,17 @@ from pathlib import Path
 import yaml
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Any
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.data_engine import DataEngine
-from core.execution_engine import ExecutionEngine
-from core.risk_engine import RiskEngine
-from core.strategy_engine import StrategyEngine
-from core.session_engine import SessionEngine
-# from core.ai_engine import AIEngine
-from core.liquidity_engine import LiquidityEngine
-from live.live_engine import LiveEngine
-from backtest.backtest_engine import BacktestEngine
+from institutional.institutional_backtest import InstitutionalBacktestEngine
+from institutional.quant_framework import GoldInstitutionalFramework
 from utils.logger import setup_logger
 
 
@@ -45,13 +43,6 @@ def parse_args():
     )
     
     parser.add_argument(
-        '--symbols',
-        type=str,
-        nargs='+',
-        help='Symbols to trade'
-    )
-    
-    parser.add_argument(
         '--start',
         type=str,
         help='Start date (YYYY-MM-DD)'
@@ -64,17 +55,24 @@ def parse_args():
     )
     
     parser.add_argument(
-        '--risk',
-        type=float,
-        default=0.5,
-        help='Risk per trade (%)'
-    )
-    
-    parser.add_argument(
         '--capital',
         type=float,
         default=100000,
         help='Initial capital'
+    )
+    
+    parser.add_argument(
+        '--timeframe',
+        type=str,
+        default='1h',
+        help='Timeframe (e.g., 1d, 1h, 30m)'
+    )
+    
+    parser.add_argument(
+        '--symbol',
+        type=str,
+        default='XAUUSD',
+        help='Trading symbol (e.g., XAUUSD, EURUSD, GBPUSD)'
     )
     
     return parser.parse_args()
@@ -97,45 +95,24 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-async def run_live_mode(config: dict, args):
-    """Run live trading mode"""
+async def run_live_mode(config: dict, args, logger):
+    """Run live trading mode using institutional framework"""
     logger.info("=" * 60)
-    logger.info("STARTING LIVE TRADING MODE")
+    logger.info("STARTING INSTITUTIONAL FRAMEWORK LIVE TRADING MODE")
+    logger.info("=" * 60)
+    
+    # TODO: Implement live trading using institutional framework
+    logger.warning("Live trading mode using institutional framework is not implemented yet")
+    logger.warning("Please use the institutional framework directly for live trading")
+
+
+async def run_backtest_mode(config: dict, args, logger):
+    """Run backtest mode using institutional framework"""
+    logger.info("=" * 60)
+    logger.info(f"STARTING INSTITUTIONAL FRAMEWORK BACKTEST MODE - {args.symbol}")
     logger.info("=" * 60)
     
     # Override config with command line args
-    if args.symbols:
-        config['assets']['forex']['symbols'] = [s for s in args.symbols if len(s) == 6]
-        config['assets']['crypto']['symbols'] = [s for s in args.symbols if 'USDT' in s]
-    
-    if args.risk:
-        config['risk_management']['max_risk_per_trade'] = args.risk
-    
-    # Create and start live engine
-    engine = LiveEngine(config)
-    
-    try:
-        await engine.start()
-    except KeyboardInterrupt:
-        logger.info("Received shutdown signal")
-        await engine.shutdown()
-    except Exception as e:
-        logger.error(f"Live trading failed: {e}", exc_info=True)
-        await engine.shutdown()
-        sys.exit(1)
-
-
-async def run_backtest_mode(config: dict, args):
-    """Run backtest mode"""
-    logger.info("=" * 60)
-    logger.info("STARTING BACKTEST MODE")
-    logger.info("=" * 60)
-    
-    # Override config with command line args
-    if args.symbols:
-        config['assets']['forex']['symbols'] = [s for s in args.symbols if len(s) == 6]
-        config['assets']['crypto']['symbols'] = [s for s in args.symbols if 'USDT' in s]
-    
     if args.start:
         config['backtesting']['start_date'] = args.start
     
@@ -145,39 +122,166 @@ async def run_backtest_mode(config: dict, args):
     if args.capital:
         config['backtesting']['initial_capital'] = args.capital
     
-    # Create engines
+    # Create data engine to load data
     data_engine = DataEngine(config)
-    strategy_engine = StrategyEngine(config)
-    risk_engine = RiskEngine(config)
-    
-    # Set risk engine reference for strategy engine
-    strategy_engine.set_risk_engine(risk_engine)
-    backtest_engine = BacktestEngine(config)
     
     try:
         # Initialize
         await data_engine.initialize()
         
-        # Load data
-        data = {}
-        for symbol in config['assets']['forex']['symbols'] + config['assets']['crypto']['symbols']:
-            df = await data_engine.get_historical_data(
-                symbol=symbol,
-                timeframe="H1",
+        logger.info(f"Loading historical data for {args.symbol}...")
+        
+        try:
+            # Load data for the selected symbol
+            symbol_data = await data_engine.get_historical_data(
+                symbol=args.symbol,
+                timeframe=args.timeframe,
                 start=datetime.strptime(config['backtesting']['start_date'], '%Y-%m-%d'),
                 end=datetime.strptime(config['backtesting']['end_date'], '%Y-%m-%d')
             )
-            if df is not None:
-                data[symbol] = df
+            
+            # Load correlation data based on symbol
+            if args.symbol == 'XAUUSD':
+                dxy_data = await data_engine.get_historical_data(
+                    symbol='DXY',
+                    timeframe=args.timeframe,
+                    start=datetime.strptime(config['backtesting']['start_date'], '%Y-%m-%d'),
+                    end=datetime.strptime(config['backtesting']['end_date'], '%Y-%m-%d')
+                )
+                
+                yield_data = await data_engine.get_historical_data(
+                    symbol='US10Y',
+                    timeframe=args.timeframe,
+                    start=datetime.strptime(config['backtesting']['start_date'], '%Y-%m-%d'),
+                    end=datetime.strptime(config['backtesting']['end_date'], '%Y-%m-%d')
+                )
+            else:
+                # For other currencies, use DXY and EURUSD as correlation data
+                dxy_data = await data_engine.get_historical_data(
+                    symbol='DXY',
+                    timeframe=args.timeframe,
+                    start=datetime.strptime(config['backtesting']['start_date'], '%Y-%m-%d'),
+                    end=datetime.strptime(config['backtesting']['end_date'], '%Y-%m-%d')
+                )
+                
+                yield_data = await data_engine.get_historical_data(
+                    symbol='EURUSD',
+                    timeframe=args.timeframe,
+                    start=datetime.strptime(config['backtesting']['start_date'], '%Y-%m-%d'),
+                    end=datetime.strptime(config['backtesting']['end_date'], '%Y-%m-%d')
+                )
+            
+            # Check if all data is loaded successfully
+            if symbol_data is None or dxy_data is None or yield_data is None:
+                raise Exception("Failed to load all required data")
+                
+        except Exception as e:
+            logger.warning(f"Failed to load real data: {e}, generating synthetic data")
+            # Generate synthetic data
+            dates = pd.date_range(config['backtesting']['start_date'], config['backtesting']['end_date'], freq='15T')
+            period_length = len(dates)
+            
+            if args.symbol == 'XAUUSD':
+                # Gold price range: ~2000-2400 with volatility
+                trend = np.linspace(2000, 2400, period_length)
+                volatility = np.linspace(25, 50, period_length)
+                random_walk = np.cumsum(np.random.randn(period_length) * volatility / 100)
+                
+                symbol_data = pd.DataFrame({
+                    'open': trend + random_walk + np.random.randn(period_length) * 2,
+                    'high': trend + random_walk + np.random.randn(period_length) * 3 + 1,
+                    'low': trend + random_walk + np.random.randn(period_length) * 3 - 1,
+                    'close': trend + random_walk + np.random.randn(period_length) * 2,
+                    'volume': np.random.randint(6000, 60000, period_length)
+                }, index=dates)
+                
+                # DXY range: ~100-105 (negative correlation to Gold)
+                dxy_trend = np.linspace(102, 104, period_length)
+                dxy_noise = np.cumsum(np.random.randn(period_length) * 0.3)
+                dxy_data = pd.DataFrame({
+                    'close': dxy_trend + dxy_noise
+                }, index=dates)
+                
+                # 10-year Treasury yield: ~4.0-4.5% (negative correlation to Gold)
+                yield_trend = np.linspace(4.2, 4.4, period_length)
+                yield_noise = np.cumsum(np.random.randn(period_length) * 0.008)
+                yield_data = pd.DataFrame({
+                    'close': yield_trend + yield_noise
+                }, index=dates)
+            elif args.symbol == 'EURUSD':
+                # EURUSD range: ~1.05-1.15 with volatility
+                trend = np.linspace(1.08, 1.12, period_length)
+                volatility = np.linspace(0.005, 0.01, period_length)
+                random_walk = np.cumsum(np.random.randn(period_length) * volatility)
+                
+                symbol_data = pd.DataFrame({
+                    'open': trend + random_walk + np.random.randn(period_length) * 0.001,
+                    'high': trend + random_walk + np.random.randn(period_length) * 0.0015 + 0.0005,
+                    'low': trend + random_walk + np.random.randn(period_length) * 0.0015 - 0.0005,
+                    'close': trend + random_walk + np.random.randn(period_length) * 0.001,
+                    'volume': np.random.randint(6000, 60000, period_length)
+                }, index=dates)
+                
+                # DXY range: ~100-105 (negative correlation to EURUSD)
+                dxy_trend = np.linspace(103, 101, period_length)
+                dxy_noise = np.cumsum(np.random.randn(period_length) * 0.3)
+                dxy_data = pd.DataFrame({
+                    'close': dxy_trend + dxy_noise
+                }, index=dates)
+                
+                # EURUSD correlation data (using EURGBP as proxy)
+                yield_trend = np.linspace(0.85, 0.87, period_length)
+                yield_noise = np.cumsum(np.random.randn(period_length) * 0.002)
+                yield_data = pd.DataFrame({
+                    'close': yield_trend + yield_noise
+                }, index=dates)
+            else:
+                # Default synthetic data for other currencies
+                trend = np.linspace(1.0, 1.1, period_length)
+                volatility = np.linspace(0.005, 0.01, period_length)
+                random_walk = np.cumsum(np.random.randn(period_length) * volatility)
+                
+                symbol_data = pd.DataFrame({
+                    'open': trend + random_walk + np.random.randn(period_length) * 0.001,
+                    'high': trend + random_walk + np.random.randn(period_length) * 0.0015 + 0.0005,
+                    'low': trend + random_walk + np.random.randn(period_length) * 0.0015 - 0.0005,
+                    'close': trend + random_walk + np.random.randn(period_length) * 0.001,
+                    'volume': np.random.randint(6000, 60000, period_length)
+                }, index=dates)
+                
+                dxy_data = pd.DataFrame({
+                    'close': np.linspace(102, 104, period_length) + np.cumsum(np.random.randn(period_length) * 0.3)
+                }, index=dates)
+                
+                yield_data = pd.DataFrame({
+                    'close': np.linspace(0.85, 0.87, period_length) + np.cumsum(np.random.randn(period_length) * 0.002)
+                }, index=dates)
         
-        # Run backtest
-        metrics = await backtest_engine.run(strategy_engine, data)
+        # Run backtest using institutional framework
+        logger.info("Running institutional framework backtest...")
+        backtest_engine = InstitutionalBacktestEngine(
+            initial_equity=config['backtesting']['initial_capital'],
+            commission=0.0005
+        )
+        
+        results = backtest_engine.run_backtest(symbol_data, dxy_data, yield_data, spread=0.3, symbol=args.symbol)
         
         # Print results
-        backtest_engine.print_summary()
+        logger.info("\n=== Institutional Framework Backtest Results ===")
+        logger.info(f"Total Return: {results['total_return']:.2%}")
+        logger.info(f"Final Equity: ${results['final_equity']:.2f}")
+        logger.info(f"Total Trades: {results['total_trades']}")
+        logger.info(f"Win Rate: {results['win_rate']:.2%}")
+        logger.info(f"Winning Trades: {results['winning_trades']}")
+        logger.info(f"Losing Trades: {results['losing_trades']}")
+        logger.info(f"Average Trade: ${results['average_trade']:.2f}")
+        logger.info(f"Risk-Reward Ratio: {results['risk_reward']:.2f}")
+        logger.info(f"Maximum Drawdown: {results['max_drawdown']:.2%}")
+        logger.info(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
         
-        # Save results
-        backtest_engine.save_results()
+        # Generate report
+        backtest_engine.generate_report(results)
+        logger.info("\nReport generated successfully in 'reports/institutional/'")
         
     except Exception as e:
         logger.error(f"Backtest failed: {e}", exc_info=True)
@@ -187,52 +291,26 @@ async def run_backtest_mode(config: dict, args):
         await data_engine.shutdown()
 
 
-async def run_optimize_mode(config: dict, args):
-    """Run parameter optimization mode"""
+async def run_optimize_mode(config: dict, args, logger):
+    """Run parameter optimization mode for institutional framework"""
     logger.info("=" * 60)
-    logger.info("STARTING OPTIMIZATION MODE")
-    logger.info("=" * 60)
-    
-    # TODO: Implement parameter optimization
-    logger.info("Optimization mode not yet implemented")
-    pass
-
-
-async def run_train_mode(config: dict, args):
-    """Run model training mode"""
-    logger.info("=" * 60)
-    logger.info("STARTING MODEL TRAINING MODE")
+    logger.info("STARTING INSTITUTIONAL FRAMEWORK OPTIMIZATION MODE")
     logger.info("=" * 60)
     
-    # Create engines
-    data_engine = DataEngine(config)
-    # ai_engine = AIEngine(config)
-    
-    try:
-        await data_engine.initialize()
-        # await ai_engine.initialize()
-        
-        # Load training data
-        X_train, y_train = await prepare_training_data(data_engine, config)
-        
-        # Train model
-        # result = await ai_engine.train(X_train, y_train)
-        
-        logger.info(f"Training complete: {result}")
-        
-    except Exception as e:
-        logger.error(f"Training failed: {e}", exc_info=True)
-        sys.exit(1)
-    
-    finally:
-        await data_engine.shutdown()
-        await ai_engine.shutdown()
+    # TODO: Implement parameter optimization for institutional framework
+    logger.warning("Optimization mode for institutional framework is not implemented yet")
+    logger.warning("Please use the institutional framework directly for parameter optimization")
 
 
-async def prepare_training_data(data_engine, config):
-    """Prepare training data for AI model"""
-    # TODO: Implement data preparation
-    return None, None
+async def run_train_mode(config: dict, args, logger):
+    """Run model training mode for institutional framework"""
+    logger.info("=" * 60)
+    logger.info("STARTING INSTITUTIONAL FRAMEWORK MODEL TRAINING MODE")
+    logger.info("=" * 60)
+    
+    # TODO: Implement model training for institutional framework
+    logger.warning("Model training mode for institutional framework is not implemented yet")
+    logger.warning("Please use the institutional framework directly for model training")
 
 
 async def main():
@@ -244,17 +322,17 @@ async def main():
     config = load_config(args.config)
     
     # Setup logging
-    logger = setup_logger(__name__, config['logging'])
+    logger = setup_logger(__name__, config.get('general', {}).get('logging', {}))
     
     # Run selected mode
     if args.mode == 'live':
-        await run_live_mode(config, args)
+        await run_live_mode(config, args, logger)
     elif args.mode == 'backtest':
-        await run_backtest_mode(config, args)
+        await run_backtest_mode(config, args, logger)
     elif args.mode == 'optimize':
-        await run_optimize_mode(config, args)
+        await run_optimize_mode(config, args, logger)
     elif args.mode == 'train':
-        await run_train_mode(config, args)
+        await run_train_mode(config, args, logger)
     else:
         logger.error(f"Unknown mode: {args.mode}")
         sys.exit(1)
